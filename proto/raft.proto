@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package hammurabi.proto;
+
+message log_entry {
+    uint32 term = 1;
+    uint32 index = 2;
+    string command = 3;
+}
+
+message append_entries_request {
+    uint32 term = 1;
+    uint32 leader_id = 2;
+    uint32 prev_log_index = 3;
+    uint32 prev_log_term = 4;
+    repeated log_entry entries = 5;
+    uint32 leader_commit = 6;
+}
+
+message append_entries_response {
+    uint32 term = 1;
+    bool success = 2;
+}
+
+message request_vote_request {
+    uint32 term = 1;
+    uint32 candidate_id = 2;
+    uint32 last_log_index = 3;
+    uint32 last_log_term = 4;
+}
+
+message request_vote_response {
+    uint32 term = 1;
+    bool vote_granted = 2;
+}
+
+message persistent_state {
+    uint32 current_term = 1;
+    uint32 voted_for = 2;
+    repeated log_entry entries = 3;
+}
