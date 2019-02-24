@@ -16,13 +16,29 @@ struct hashmap {
     explicit hashmap(std::size_t bucket_count)
             : m{bucket_count} {}
 
-    bool get(const char *key, boost::any &value);
+    bool get(const char *key, boost::any &value) {
+        auto itr = m.find(key);
+        if (itr != m.end()) {
+            value = itr->second;
+            return true;
+        }
+        return false;
+    }
 
-    void set(const char *key, const boost::any &value);
+    void set(const char *key, const boost::any &value) {
+        m[key] = value;
+    }
 
-    bool exists(const char *key);
+    bool exists(const char *key) {
+        return m.find(key) != m.end();
+    }
 
-    void remove(const char *key);
+    void remove(const char *key) {
+        auto itr = m.find(key);
+        if (itr != m.end()) {
+            m.erase(itr);
+        }
+    }
 
     map m;
 };
