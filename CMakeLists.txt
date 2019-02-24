@@ -13,7 +13,7 @@ find_package(Protobuf REQUIRED)
 find_package(Catch2 REQUIRED)
 
 add_library(hammurabi STATIC connector.cpp connector.h deadline_timer.cpp deadline_timer.h kv_store.cpp kv_store.h
-        raft.cpp raft.h detail/rng.h types.h detail/hashmap.cpp detail/hashmap.h)
+        raft.cpp raft.h detail/rng.h types.h detail/hashmap.cpp detail/hashmap.h proto/raft.pb.cc proto/raft.pb.h)
 target_include_directories(hammurabi SYSTEM PRIVATE ${Boost_INCLUDE_DIR} ${Protobuf_INCLUDE_DIRS})
 
 add_executable(tests tests.cpp)
