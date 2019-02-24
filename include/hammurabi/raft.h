@@ -6,7 +6,7 @@
 #include "detail/rng.h"
 #include "types.h"
 
-#include "proto/raft.pb.h"
+#include "../../proto/raft.pb.h"
 
 #include <boost/asio.hpp>
 

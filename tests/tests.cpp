@@ -1,7 +1,7 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 
-#include "kv_store.h"
+#include "include/hammurabi/kv_store.h"
 
 TEST_CASE("Instantiation") {
     CHECK_NOTHROW(hammurabi::kv_store{1000});

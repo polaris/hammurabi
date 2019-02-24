@@ -1,4 +1,4 @@
-#include "raft.h"
+#include "../include/hammurabi/raft.h"
 
 #include <boost/filesystem.hpp>
 #include <boost/iostreams/device/mapped_file.hpp>

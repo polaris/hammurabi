@@ -1,5 +1,5 @@
-#include "connector.h"
-#include "raft.h"
+#include "include/hammurabi/connector.h"
+#include "include/hammurabi/raft.h"
 #include "proto/raft.pb.h"
 
 #include <iostream>
