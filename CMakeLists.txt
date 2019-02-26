@@ -12,7 +12,7 @@ find_package(Boost 1.68.0 REQUIRED COMPONENTS system filesystem)
 find_package(Protobuf REQUIRED)
 find_package(Catch2 REQUIRED)
 
-add_library(hammurabi STATIC src/connector.cpp include/hammurabi/connector.h src/deadline_timer.cpp include/hammurabi/deadline_timer.h src/kv_store.cpp include/hammurabi/kv_store.h
+add_library(hammurabi STATIC src/connector.cpp include/hammurabi/connector.h include/hammurabi/detail/deadline_timer.h src/kv_store.cpp include/hammurabi/kv_store.h
         src/raft.cpp include/hammurabi/raft.h include/hammurabi/detail/rng.h include/hammurabi/types.h include/hammurabi/detail/hashmap.h proto/raft.pb.cc proto/raft.pb.h)
 target_include_directories(hammurabi SYSTEM PRIVATE ${Boost_INCLUDE_DIR} ${Protobuf_INCLUDE_DIRS})
 
