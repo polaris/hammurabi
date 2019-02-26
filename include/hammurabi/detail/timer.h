@@ -7,9 +7,9 @@ namespace hammurabi {
 
 namespace detail {
 
-class deadline_timer {
+class timer {
 public:
-    deadline_timer(boost::asio::io_service &ioc, std::function<void()> callback)
+    timer(boost::asio::io_service &ioc, std::function<void()> callback)
             : timer_{ioc}
             , callback_{std::move(callback)} {
     }

@@ -2,3 +2,4 @@
 proto/raft.pb.h
 proto/raft.pb.cc
 cmake-build-*
+build

@@ -1,7 +1,7 @@
-#ifndef HAMMURABI_SERVER_H
-#define HAMMURABI_SERVER_H
+#ifndef HAMMURABI_RAFT_H
+#define HAMMURABI_RAFT_H
 
-#include "detail/deadline_timer.h"
+#include "detail/timer.h"
 
 #include "connector.h"
 #include "detail/rng.h"
@@ -100,7 +100,7 @@ private:
     void load_persistent_state();
     void store_persistent_state();
 
-    detail::deadline_timer timer_;
+    detail::timer timer_;
     connector conn_;
     detail::rng<unsigned int> election_timeout_;
     endpoint_map_t peers_;
@@ -127,4 +127,4 @@ private:
 
 }
 
-#endif // HAMMURABI_SERVER_H
+#endif // HAMMURABI_RAFT_H
