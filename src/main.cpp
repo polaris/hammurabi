@@ -18,7 +18,7 @@ int main(int argc, char* argv[]) {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
 
     if (argc < 3) {
-        std::cout << argv[0] << " <index>\n";
+        std::cout << argv[0] << " <PORT>\n";
         return -1;
     }
 
