@@ -6,11 +6,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
+set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake/modules)
 
 find_package(Boost 1.68.0 REQUIRED COMPONENTS system filesystem)
 find_package(Protobuf REQUIRED)
 find_package(Catch2 REQUIRED)
+find_package(Remote 1.0.0 REQUIRED)
 
 add_library(hammurabi STATIC src/connector.cpp include/hammurabi/connector.h include/hammurabi/detail/timer.h
         src/kv_store.cpp include/hammurabi/kv_store.h src/raft.cpp include/hammurabi/raft.h
