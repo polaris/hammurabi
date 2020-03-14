@@ -34,6 +34,7 @@ struct request_vote_response_received {
 raft::raft(boost::asio::io_service& io_service, unsigned short port, endpoint_map_t peers)
 : timer_{io_service, [this](){ current_state_->process_event(timeout{}); }}
 , conn_{io_service, port}
+, rpc_server_{io_service, "0.0.0.0", port}
 , election_timeout_{150, 300}
 , peers_{std::move(peers)}
 , current_state_{new raft::follower{*this}}
@@ -47,6 +48,11 @@ raft::raft(boost::asio::io_service& io_service, unsigned short port, endpoint_ma
     if (log_.empty()) {
         log_.emplace_back(log_entry{0});
     }
+
+    std::function<std::tuple<int, std::string> (int)> append_entries_handler = [](int i) {
+        return std::make_tuple<int, std::string>(i + 1000, "foo");
+    };
+    rpc_server_.add_procedure("AppendEntries", append_entries_handler);
 
     conn_.receive([this](uint8_t* input_data_, std::size_t bytes_received){
         const auto message_type = static_cast<rpc_type>(input_data_[0]);
@@ -184,7 +190,7 @@ void raft::store_persistent_state() {
         proto::persistent_state state;
         state.set_current_term(current_term_);
         state.set_voted_for(voted_for_);
-        std::cout << current_term_ << ": " << voted_for_ << std::endl;
+        std::cout << "[" << current_term_ << "] Voted for: " << voted_for_ << std::endl;
         for (const auto& entry : log_) {
             proto::log_entry* e = state.add_entries();
             e->set_term(entry.term_received);

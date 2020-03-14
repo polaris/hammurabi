@@ -10,6 +10,7 @@
 #include "../../proto/raft.pb.h"
 
 #include <boost/asio.hpp>
+#include <remote/rpc_server.h>
 
 #include <memory>
 #include <unordered_map>
@@ -49,7 +50,7 @@ private:
     void send_request_vote_response(const endpoint_t &endpoint, bool vote_granted);
     void send_append_entries();
     void send_append_entries_response(const endpoint_t &endpoint, bool success);
-    std::string persistent_state_filename() const;
+    [[nodiscard]] std::string persistent_state_filename() const;
 
     struct state {
         explicit state(raft& server) : server_{server} {}
@@ -83,7 +84,7 @@ private:
         void process_event(request_vote_response_received const& event) override;
     private:
         void start_new_election();
-        bool has_majority() const;
+        [[nodiscard]] bool has_majority() const;
         unsigned int votes_;
     };
 
@@ -102,6 +103,7 @@ private:
 
     detail::timer timer_;
     connector conn_;
+    remote::rpc_server rpc_server_;
     detail::rng<unsigned int> election_timeout_;
     endpoint_map_t peers_;
     std::unique_ptr<state> current_state_;
