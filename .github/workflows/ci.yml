@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-24.04 / gcc-14
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+          - name: macos-latest / apple-clang
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install tools
+        run: pip install -r requirements.txt
+
+      - name: Detect Conan profile
+        run: conan profile detect
+
+      # Restore and save are separate steps so the package cache is saved right after
+      # `conan install`, even if the build or tests fail later in the job.
+      - name: Restore Conan cache
+        id: conan-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.os }}-${{ matrix.cc }}-${{ hashFiles('conanfile.txt') }}
+
+      - name: Install dependencies
+        run: conan install . --build=missing -s build_type=Debug -s compiler.cppstd=23
+
+      - name: Save Conan cache
+        if: steps.conan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.conan2/p
+          key: ${{ steps.conan-cache.outputs.cache-primary-key }}
+
+      - name: Configure
+        run: cmake --preset conan-debug
+
+      - name: Build
+        run: cmake --build --preset conan-debug --parallel
+
+      - name: Test
+        run: ctest --preset conan-debug --output-on-failure
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install tools
+        run: pip install -r requirements.txt
+
+      - name: Check formatting
+        run: git ls-files '*.cpp' '*.h' | xargs clang-format --dry-run --Werror

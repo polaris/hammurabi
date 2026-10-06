@@ -1,15 +1,13 @@
 #ifndef HAMMURABI_RAFT_H
 #define HAMMURABI_RAFT_H
 
-#include "detail/timer.h"
-
 #include "connector.h"
 #include "detail/rng.h"
+#include "detail/timer.h"
+#include "proto/raft.pb.h"
 #include "types.h"
 
-#include "../../proto/raft.pb.h"
-
-#include <boost/asio.hpp>
+#include <asio.hpp>
 
 #include <memory>
 #include <unordered_map>
@@ -37,18 +35,18 @@ struct request_vote_response_received;
 
 class raft {
 public:
-    raft(boost::asio::io_service& io_service, unsigned short port, endpoint_map_t peers);
+    raft(asio::io_context& io_service, unsigned short port, endpoint_map_t peers);
 
     virtual ~raft() = default;
 
 private:
-    template <typename T>
+    template<typename T>
     void set_state();
-    void send_message(const boost::asio::ip::udp::endpoint &endpoint, const google::protobuf::Message &message, rpc_type type);
+    void send_message(const asio::ip::udp::endpoint& endpoint, const google::protobuf::Message& message, rpc_type type);
     void send_request_votes();
-    void send_request_vote_response(const endpoint_t &endpoint, bool vote_granted);
+    void send_request_vote_response(const endpoint_t& endpoint, bool vote_granted);
     void send_append_entries();
-    void send_append_entries_response(const endpoint_t &endpoint, bool success);
+    void send_append_entries_response(const endpoint_t& endpoint, bool success);
     std::string persistent_state_filename() const;
 
     struct state {
@@ -59,6 +57,7 @@ private:
         virtual void process_event(append_entries_response_received const& event) = 0;
         virtual void process_event(request_vote_request_received const& event) = 0;
         virtual void process_event(request_vote_response_received const& event) = 0;
+
     protected:
         raft& server_;
     };
@@ -81,10 +80,11 @@ private:
         void process_event(append_entries_response_received const& event) override;
         void process_event(request_vote_request_received const& event) override;
         void process_event(request_vote_response_received const& event) override;
+
     private:
         void start_new_election();
         bool has_majority() const;
-        unsigned int votes_;
+        unsigned int votes_{0};
     };
 
     struct leader : public state {
@@ -108,23 +108,23 @@ private:
     server_id_t server_id_;
 
     // Persistent state_ on all servers
-    term_t current_term_;           // latest term server has seen
-    server_id_t voted_for_;         // candidate's server id that received vote in current term; or 0 if none
-    std::vector<log_entry> log_;    // log entries; first index is 1
+    term_t current_term_{0};        // latest term server has seen
+    server_id_t voted_for_{0};      // candidate's server id that received vote in current term; or 0 if none
+    std::vector<log_entry> log_; // log entries; first index is 1
 
     // Volatile state_ on all servers
-    log_index_t commit_index_;      // index of highest log entry known to be committed
-    log_index_t last_applied_;      // index of highest log entry applied to state machine
+    log_index_t commit_index_{0}; // index of highest log entry known to be committed
+    log_index_t last_applied_{0}; // index of highest log entry applied to state machine
 
     // Volatile state_ on leaders
-    std::unordered_map<server_id_t, log_index_t> next_index_;   // for each server, index of the next log entry to send
-                                                                // to that server (initialized to leader last log
-                                                                // index + 1)
-    std::unordered_map<server_id_t, log_index_t> match_index_;  // for each server, index of highest log entry known to
-                                                                // be replicated on server (initialized to 0, increases
-                                                                // monotonically)
+    std::unordered_map<server_id_t, log_index_t> next_index_;  // for each server, index of the next log entry to send
+                                                               // to that server (initialized to leader last log
+                                                               // index + 1)
+    std::unordered_map<server_id_t, log_index_t> match_index_; // for each server, index of highest log entry known to
+                                                               // be replicated on server (initialized to 0, increases
+                                                               // monotonically)
 };
 
-}
+} // namespace hammurabi
 
 #endif // HAMMURABI_RAFT_H

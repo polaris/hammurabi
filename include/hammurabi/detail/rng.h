@@ -3,9 +3,9 @@
 
 #include <random>
 
-namespace hammurabi {
 
-namespace detail {
+
+namespace hammurabi::detail {
 
 template<typename IntType>
 class rng {
@@ -21,19 +21,17 @@ private:
 };
 
 template<typename IntType>
-rng<IntType>::rng(IntType a, IntType b)
-        : device_{}
-        , generator_{device_()}
-        , distribution_{a, b} {
-}
+rng<IntType>::rng(IntType a, IntType b) : device_{}
+                                        , generator_{device_()}
+                                        , distribution_{a, b} {}
 
 template<typename IntType>
 IntType rng<IntType>::operator()() {
     return distribution_(generator_);
 }
 
-}
+} // namespace hammurabi::detail
 
-}
 
-#endif //HAMMURABI_RNG_H
+
+#endif // HAMMURABI_RNG_H

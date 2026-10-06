@@ -1,9 +1,7 @@
-#include "../include/hammurabi/raft.h"
-
-#include <boost/filesystem.hpp>
-#include <boost/iostreams/device/mapped_file.hpp>
+#include "hammurabi/raft.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 
@@ -31,24 +29,21 @@ struct request_vote_response_received {
     proto::request_vote_response message;
 };
 
-raft::raft(boost::asio::io_service& io_service, unsigned short port, endpoint_map_t peers)
-: timer_{io_service, [this](){ current_state_->process_event(timeout{}); }}
+raft::raft(asio::io_context& io_service, unsigned short port, endpoint_map_t peers)
+: timer_{io_service, [this]() { current_state_->process_event(timeout{}); }}
 , conn_{io_service, port}
 , election_timeout_{150, 300}
 , peers_{std::move(peers)}
 , current_state_{new raft::follower{*this}}
 , server_id_{port}
-, current_term_{0}
-, voted_for_{0}
-, commit_index_{0}
-, last_applied_{0} {
+ {
     load_persistent_state();
 
     if (log_.empty()) {
-        log_.emplace_back(log_entry{0});
+        log_.emplace_back(0);
     }
 
-    conn_.receive([this](uint8_t* input_data_, std::size_t bytes_received){
+    conn_.receive([this](uint8_t* input_data_, std::size_t bytes_received) {
         const auto message_type = static_cast<rpc_type>(input_data_[0]);
         switch (message_type) {
             case rpc_type::append_entry_request: {
@@ -83,17 +78,18 @@ raft::raft(boost::asio::io_service& io_service, unsigned short port, endpoint_ma
     });
 }
 
-template <typename T>
+template<typename T>
 void raft::set_state() {
     current_state_.reset();
     current_state_.reset(new T{*this});
 }
 
-void raft::send_message(const boost::asio::ip::udp::endpoint &endpoint, const google::protobuf::Message &message, rpc_type type) {
+void raft::send_message(const asio::ip::udp::endpoint& endpoint, const google::protobuf::Message& message,
+                        rpc_type type) {
     enum { max_length = 1024 };
     uint8_t buffer[max_length];
-    bzero(buffer, max_length);
-    buffer[0] = static_cast<uint8_t >(type);
+    std::fill(buffer, buffer + max_length, 0);
+    buffer[0] = static_cast<uint8_t>(type);
     const std::size_t length = message.ByteSizeLong();
     message.SerializeToArray(buffer + 1, static_cast<int>(length));
     conn_.send(endpoint, buffer, length + 1);
@@ -110,7 +106,7 @@ void raft::send_request_votes() {
     }
 }
 
-void raft::send_request_vote_response(const endpoint_t &endpoint, bool vote_granted) {
+void raft::send_request_vote_response(const endpoint_t& endpoint, bool vote_granted) {
     proto::request_vote_response message;
     message.set_term(current_term_);
     message.set_vote_granted(vote_granted);
@@ -144,7 +140,7 @@ void raft::send_append_entries() {
     }
 }
 
-void raft::send_append_entries_response(const endpoint_t &endpoint, bool success) {
+void raft::send_append_entries_response(const endpoint_t& endpoint, bool success) {
     proto::append_entries_response message;
     message.set_term(current_term_);
     message.set_success(success);
@@ -156,7 +152,7 @@ void raft::load_persistent_state() {
     try {
         const std::string filename = persistent_state_filename();
 
-        if (!boost::filesystem::exists(filename)) {
+        if (!std::filesystem::exists(filename)) {
             return;
         }
 
@@ -164,7 +160,7 @@ void raft::load_persistent_state() {
         std::ifstream ifs{filename, std::ios::binary | std::ios::ate};
         const long length = ifs.tellg();
         ifs.seekg(std::ifstream::beg);
-        std::unique_ptr<uint8_t []> buffer{new uint8_t [length]};
+        std::unique_ptr<uint8_t[]> buffer{new uint8_t[length]};
         ifs.read(reinterpret_cast<char*>(buffer.get()), length);
         ifs.close();
 
@@ -184,7 +180,7 @@ void raft::store_persistent_state() {
         proto::persistent_state state;
         state.set_current_term(current_term_);
         state.set_voted_for(voted_for_);
-        std::cout << current_term_ << ": " << voted_for_ << std::endl;
+        std::cout << current_term_ << ": " << voted_for_ << '\n';
         for (const auto& entry : log_) {
             proto::log_entry* e = state.add_entries();
             e->set_term(entry.term_received);
@@ -192,7 +188,7 @@ void raft::store_persistent_state() {
         }
 
         const std::size_t length = state.ByteSizeLong();
-        std::unique_ptr<uint8_t []> buffer{new uint8_t [length]};
+        std::unique_ptr<uint8_t[]> buffer{new uint8_t[length]};
         state.SerializeToArray(buffer.get(), static_cast<int>(length));
 
         // TODO: Use memory-mapped file.
@@ -209,15 +205,16 @@ std::string raft::persistent_state_filename() const {
     return ss.str();
 }
 
-raft::follower::follower(raft& server)
-: state(server) {
-    server_.timer_.reset(boost::posix_time::milliseconds{server_.election_timeout_()});
-    std::cout << "follower" << std::endl;
+raft::follower::follower(raft& server) : state(server) {
+    server_.timer_.reset(std::chrono::milliseconds{server_.election_timeout_()});
+    std::cout << "follower" << '\n';
 }
 
-void raft::follower::process_event(timeout const&) { server_.set_state<candidate>(); }
+void raft::follower::process_event(timeout const&) {
+    server_.set_state<candidate>();
+}
 
-void raft::follower::process_event(append_entries_request_received const &event) {
+void raft::follower::process_event(append_entries_request_received const& event) {
     if (event.message.term() > server_.current_term_) {
         server_.current_term_ = event.message.term();
         server_.voted_for_ = 0;
@@ -233,14 +230,14 @@ void raft::follower::process_event(append_entries_request_received const &event)
             }
         }
 
-        server_.timer_.reset(boost::posix_time::milliseconds{server_.election_timeout_()});
+        server_.timer_.reset(std::chrono::milliseconds{server_.election_timeout_()});
         server_.send_append_entries_response(server_.peers_[event.message.leader_id()], true);
     } else {
         server_.send_append_entries_response(server_.peers_[event.message.leader_id()], false);
     }
 }
 
-void raft::follower::process_event(append_entries_response_received const &event) {
+void raft::follower::process_event(append_entries_response_received const& event) {
     if (event.message.term() > server_.current_term_) {
         server_.current_term_ = event.message.term();
         server_.voted_for_ = 0;
@@ -249,7 +246,8 @@ void raft::follower::process_event(append_entries_response_received const &event
 }
 
 void raft::follower::process_event(request_vote_request_received const& event) {
-    if (event.message.term() > server_.current_term_ || ((event.message.term() == server_.current_term_) && (server_.voted_for_ == 0))) {
+    if (event.message.term() > server_.current_term_ ||
+        ((event.message.term() == server_.current_term_) && (server_.voted_for_ == 0))) {
         server_.current_term_ = event.message.term();
         server_.voted_for_ = event.message.candidate_id();
         server_.store_persistent_state();
@@ -259,7 +257,7 @@ void raft::follower::process_event(request_vote_request_received const& event) {
     }
 }
 
-void raft::follower::process_event(request_vote_response_received const &event) {
+void raft::follower::process_event(request_vote_response_received const& event) {
     if (event.message.term() > server_.current_term_) {
         server_.current_term_ = event.message.term();
         server_.voted_for_ = 0;
@@ -267,16 +265,16 @@ void raft::follower::process_event(request_vote_response_received const &event) 
     }
 }
 
-raft::candidate::candidate(raft& server)
-: state(server)
-, votes_{0} {
+raft::candidate::candidate(raft& server) : state(server) {
     start_new_election();
-    std::cout << "candidate" << std::endl;
+    std::cout << "candidate" << '\n';
 }
 
-void raft::candidate::process_event(timeout const&) { start_new_election(); }
+void raft::candidate::process_event(timeout const&) {
+    start_new_election();
+}
 
-void raft::candidate::process_event(append_entries_request_received const &event) {
+void raft::candidate::process_event(append_entries_request_received const& event) {
     if (event.message.term() >= server_.current_term_) {
         server_.set_state<follower>();
         server_.current_state_->process_event(event);
@@ -285,7 +283,7 @@ void raft::candidate::process_event(append_entries_request_received const &event
     }
 }
 
-void raft::candidate::process_event(append_entries_response_received const &event) {
+void raft::candidate::process_event(append_entries_response_received const& event) {
     if (event.message.term() > server_.current_term_) {
         server_.set_state<follower>();
         server_.current_state_->process_event(event);
@@ -293,7 +291,8 @@ void raft::candidate::process_event(append_entries_response_received const &even
 }
 
 void raft::candidate::process_event(request_vote_request_received const& event) {
-    if (event.message.term() > server_.current_term_ || ((event.message.term() == server_.current_term_) && (server_.voted_for_ == 0))) {
+    if (event.message.term() > server_.current_term_ ||
+        ((event.message.term() == server_.current_term_) && (server_.voted_for_ == 0))) {
         server_.set_state<follower>();
         server_.current_state_->process_event(event);
     } else {
@@ -319,29 +318,28 @@ void raft::candidate::start_new_election() {
     server_.store_persistent_state();
     votes_ = 1;
     server_.send_request_votes();
-    server_.timer_.reset(boost::posix_time::milliseconds{server_.election_timeout_()});
+    server_.timer_.reset(std::chrono::milliseconds{server_.election_timeout_()});
 }
 
 bool raft::candidate::has_majority() const {
     return votes_ >= floor(server_.peers_.size() / 2.0) + 1;
 }
 
-raft::leader::leader(raft& server)
-: state(server) {
+raft::leader::leader(raft& server) : state(server) {
     for (auto const& peer : server_.peers_) {
         server_.next_index_[peer.first] = static_cast<hammurabi::log_index_t>(server_.log_.size() + 1);
         server_.match_index_[peer.first] = 0;
     }
-    server_.timer_.reset(boost::posix_time::milliseconds{0});
-    std::cout << "leader" << std::endl;
+    server_.timer_.reset(std::chrono::milliseconds{0});
+    std::cout << "leader" << '\n';
 }
 
 void raft::leader::process_event(timeout const&) {
     server_.send_append_entries();
-    server_.timer_.reset(boost::posix_time::milliseconds{100});
+    server_.timer_.reset(std::chrono::milliseconds{100});
 }
 
-void raft::leader::process_event(append_entries_request_received const &event) {
+void raft::leader::process_event(append_entries_request_received const& event) {
     if (event.message.term() >= server_.current_term_) {
         server_.set_state<follower>();
         server_.current_state_->process_event(event);
@@ -350,7 +348,7 @@ void raft::leader::process_event(append_entries_request_received const &event) {
     }
 }
 
-void raft::leader::process_event(append_entries_response_received const &event) {
+void raft::leader::process_event(append_entries_response_received const& event) {
     if (event.message.term() > server_.current_term_) {
         server_.set_state<follower>();
         server_.current_state_->process_event(event);
@@ -373,11 +371,11 @@ void raft::leader::process_event(request_vote_request_received const& event) {
     }
 }
 
-void raft::leader::process_event(request_vote_response_received const &event) {
+void raft::leader::process_event(request_vote_response_received const& event) {
     if (event.message.term() > server_.current_term_) {
         server_.set_state<follower>();
         server_.current_state_->process_event(event);
     }
 }
 
-}   // namespace hammurabi
+} // namespace hammurabi

@@ -1,0 +1,16 @@
+[requires]
+asio/1.38.2
+protobuf/7.35.0
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout
+
+[tool_requires]
+protobuf/7.35.0
+
+[test_requires]
+catch2/3.15.3

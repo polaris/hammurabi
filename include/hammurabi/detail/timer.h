@@ -1,46 +1,41 @@
 #ifndef HAMMURABI_TIMER_H
 #define HAMMURABI_TIMER_H
 
-#include <boost/asio.hpp>
+#include <asio.hpp>
 
-namespace hammurabi {
+#include <chrono>
 
-namespace detail {
+
+
+namespace hammurabi::detail {
 
 class timer {
 public:
-    timer(boost::asio::io_service &ioc, std::function<void()> callback)
-            : timer_{ioc}
-            , callback_{std::move(callback)} {
-    }
+    timer(asio::io_context& ioc, std::function<void()> callback) : timer_{ioc}, callback_{std::move(callback)} {}
 
-
-    void start(const boost::posix_time::milliseconds &timeout) {
-        timer_.expires_from_now(timeout);
-        timer_.async_wait([this](const boost::system::error_code& ec) {
-            if (ec != boost::asio::error::operation_aborted) {
+    void start(const std::chrono::milliseconds& timeout) {
+        timer_.expires_after(timeout);
+        timer_.async_wait([this](const asio::error_code& ec) {
+            if (ec != asio::error::operation_aborted) {
                 callback_();
             }
         });
     }
 
-    void stop()  {
-        boost::system::error_code ec;
-        timer_.cancel(ec);
-    }
+    void stop() { timer_.cancel(); }
 
-    void reset(const boost::posix_time::milliseconds &timeout) {
+    void reset(const std::chrono::milliseconds& timeout) {
         stop();
         start(timeout);
     }
 
 private:
-    boost::asio::deadline_timer timer_;
+    asio::steady_timer timer_;
     std::function<void()> callback_;
 };
 
-}
+} // namespace hammurabi::detail
 
-}
 
-#endif //HAMMURABI_TIMER_H
+
+#endif // HAMMURABI_TIMER_H
