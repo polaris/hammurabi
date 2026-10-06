@@ -23,8 +23,8 @@ int main(int argc, char* argv[]) {
     const auto peerPorts = convertTo(splitString(argv[2]));
 
     hammurabi::endpoint_map_t peers;
-    for (const auto port : peerPorts) {
-        peers[port] = hammurabi::endpoint_t{asio::ip::make_address("127.0.0.1"), port};
+    for (const auto peerPort : peerPorts) {
+        peers[peerPort] = hammurabi::endpoint_t{asio::ip::make_address("127.0.0.1"), peerPort};
     }
 
     asio::io_context io;

@@ -6,6 +6,6 @@ protobuf_generate(
     IMPORT_DIRS ${PROJECT_SOURCE_DIR}
 )
 
-target_compile_features(hammurabi PUBLIC cxx_std_20)
+target_compile_features(hammurabi PUBLIC cxx_std_23)
 target_include_directories(hammurabi PUBLIC ${PROJECT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(hammurabi PUBLIC asio::asio protobuf::libprotobuf)
