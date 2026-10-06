@@ -35,8 +35,7 @@ raft::raft(asio::io_context& io_service, unsigned short port, endpoint_map_t pee
 , election_timeout_{150, 300}
 , peers_{std::move(peers)}
 , current_state_{new raft::follower{*this}}
-, server_id_{port}
- {
+, server_id_{port} {
     load_persistent_state();
 
     if (log_.empty()) {

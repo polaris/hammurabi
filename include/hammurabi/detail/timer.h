@@ -5,8 +5,6 @@
 
 #include <chrono>
 
-
-
 namespace hammurabi::detail {
 
 class timer {
@@ -35,7 +33,5 @@ private:
 };
 
 } // namespace hammurabi::detail
-
-
 
 #endif // HAMMURABI_TIMER_H

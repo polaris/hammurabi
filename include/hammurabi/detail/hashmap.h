@@ -5,8 +5,6 @@
 #include <string>
 #include <unordered_map>
 
-
-
 namespace hammurabi::detail {
 
 using map = std::unordered_map<std::string, std::any>;
@@ -38,7 +36,5 @@ struct hashmap {
 };
 
 } // namespace hammurabi::detail
-
-
 
 #endif // KIWI_HASHMAP_H

@@ -54,7 +54,7 @@ std::vector<std::string> splitString(const std::string& s) {
 std::vector<asio::ip::port_type> convertTo(const std::vector<std::string>& v) {
     std::vector<asio::ip::port_type> result;
     result.reserve(v.size());
-for (const auto& s : v) {
+    for (const auto& s : v) {
         result.emplace_back(static_cast<asio::ip::port_type>(std::stoi(s)));
     }
     return result;

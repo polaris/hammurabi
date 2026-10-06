@@ -108,8 +108,8 @@ private:
     server_id_t server_id_;
 
     // Persistent state_ on all servers
-    term_t current_term_{0};        // latest term server has seen
-    server_id_t voted_for_{0};      // candidate's server id that received vote in current term; or 0 if none
+    term_t current_term_{0};     // latest term server has seen
+    server_id_t voted_for_{0};   // candidate's server id that received vote in current term; or 0 if none
     std::vector<log_entry> log_; // log entries; first index is 1
 
     // Volatile state_ on all servers

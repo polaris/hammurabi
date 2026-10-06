@@ -3,8 +3,6 @@
 
 #include <random>
 
-
-
 namespace hammurabi::detail {
 
 template<typename IntType>
@@ -31,7 +29,5 @@ IntType rng<IntType>::operator()() {
 }
 
 } // namespace hammurabi::detail
-
-
 
 #endif // HAMMURABI_RNG_H
