@@ -21,6 +21,11 @@ jobs:
             os: macos-latest
             cc: clang
             cxx: clang++
+          - name: ubuntu-24.04 / gcc-14 / asan+ubsan
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            sanitizers: address,undefined
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
@@ -59,13 +64,15 @@ jobs:
           key: ${{ steps.conan-cache.outputs.cache-primary-key }}
 
       - name: Configure
-        run: cmake --preset conan-debug
+        run: cmake --preset conan-debug -DHAMMURABI_SANITIZERS=${{ matrix.sanitizers }}
 
       - name: Build
         run: cmake --build --preset conan-debug --parallel
 
       - name: Test
         run: ctest --preset conan-debug --output-on-failure
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
 
   format:
     runs-on: ubuntu-24.04

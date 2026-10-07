@@ -1,0 +1,28 @@
+# Per-target build settings for hammurabi's own code.
+#
+# Both functions set options PRIVATE, so they never leak to consumers of a target.
+# Third-party and generated code is excluded by simply not calling them on those targets.
+
+function(hammurabi_target_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE
+                /W4
+                $<$<BOOL:${HAMMURABI_WARNINGS_AS_ERRORS}>:/WX>)
+    else()
+        target_compile_options(${target} PRIVATE
+                -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+                $<$<BOOL:${HAMMURABI_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+endfunction()
+
+# HAMMURABI_SANITIZERS is passed straight to -fsanitize=, e.g. "address,undefined" or "thread".
+function(hammurabi_target_sanitizers target)
+    if(NOT HAMMURABI_SANITIZERS)
+        return()
+    endif()
+    if(MSVC)
+        message(FATAL_ERROR "HAMMURABI_SANITIZERS is not supported with MSVC")
+    endif()
+    target_compile_options(${target} PRIVATE -fsanitize=${HAMMURABI_SANITIZERS} -fno-omit-frame-pointer)
+    target_link_options(${target} PRIVATE -fsanitize=${HAMMURABI_SANITIZERS})
+endfunction()
