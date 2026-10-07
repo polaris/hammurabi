@@ -90,7 +90,9 @@ void raft::send_message(const asio::ip::udp::endpoint& endpoint, const google::p
     std::fill(buffer, buffer + max_length, 0);
     buffer[0] = static_cast<uint8_t>(type);
     const std::size_t length = message.ByteSizeLong();
-    message.SerializeToArray(buffer + 1, static_cast<int>(length));
+    if (!message.SerializeToArray(buffer + 1, static_cast<int>(length))) {
+        return;
+    }
     conn_.send(endpoint, buffer, length + 1);
 }
 
@@ -159,7 +161,7 @@ void raft::load_persistent_state() {
         std::ifstream ifs{filename, std::ios::binary | std::ios::ate};
         const long length = ifs.tellg();
         ifs.seekg(std::ifstream::beg);
-        std::unique_ptr<uint8_t[]> buffer{new uint8_t[length]};
+        std::unique_ptr<uint8_t[]> buffer{new uint8_t[static_cast<std::size_t>(length)]};
         ifs.read(reinterpret_cast<char*>(buffer.get()), length);
         ifs.close();
 
@@ -188,11 +190,13 @@ void raft::store_persistent_state() {
 
         const std::size_t length = state.ByteSizeLong();
         std::unique_ptr<uint8_t[]> buffer{new uint8_t[length]};
-        state.SerializeToArray(buffer.get(), static_cast<int>(length));
+        if (!state.SerializeToArray(buffer.get(), static_cast<int>(length))) {
+            return;
+        }
 
         // TODO: Use memory-mapped file.
         std::ofstream ofs{persistent_state_filename(), std::ios::binary | std::ios::trunc};
-        ofs.write(reinterpret_cast<const char*>(buffer.get()), length);
+        ofs.write(reinterpret_cast<const char*>(buffer.get()), static_cast<std::streamsize>(length));
         ofs.close();
     } catch (...) {
     }

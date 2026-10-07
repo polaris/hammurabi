@@ -31,9 +31,9 @@ jobs:
       CXX: ${{ matrix.cxx }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -42,13 +42,13 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Detect Conan profile
-        run: conan profile detect
+        run: conan profile detect && conan profile show > conan-profile.txt
 
       # Restore and save are separate steps so the package cache is saved right after
       # `conan install`, even if the build or tests fail later in the job.
       - name: Restore Conan cache
         id: conan-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.conan2/p
           key: conan-${{ matrix.os }}-${{ hashFiles('conanfile.txt', 'conan-profile.txt') }}
@@ -58,7 +58,7 @@ jobs:
 
       - name: Save Conan cache
         if: steps.conan-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.conan2/p
           key: ${{ steps.conan-cache.outputs.cache-primary-key }}
@@ -70,14 +70,14 @@ jobs:
         run: cmake --build --preset conan-debug --parallel
 
       - name: Test
-        run: ctest --preset conan-debug --output-on-failure
+        run: ctest --preset conan-debug --output-on-failure --notests=error
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
 
   format:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v5
         with:
