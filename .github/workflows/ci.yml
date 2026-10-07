@@ -54,7 +54,7 @@ jobs:
           key: conan-${{ matrix.os }}-${{ matrix.cc }}-${{ hashFiles('conanfile.txt') }}
 
       - name: Install dependencies
-        run: conan install . --build=missing -s build_type=Debug -s compiler.cppstd=23
+        run: conan install . --build=missing -s build_type=Debug -s compiler.cppstd=23 -c tools.cmake.cmaketoolchain:generator=Ninja
 
       - name: Save Conan cache
         if: steps.conan-cache.outputs.cache-hit != 'true'

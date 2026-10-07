@@ -3,3 +3,4 @@
 conan==2.33.0
 clang-tidy==22.1.8
 clang_format==23.1.2
+ninja==1.13.2
