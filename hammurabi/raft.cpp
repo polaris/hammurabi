@@ -325,7 +325,7 @@ void raft::candidate::start_new_election() {
 }
 
 bool raft::candidate::has_majority() const {
-    return votes_ >= floor(server_.peers_.size() / 2.0) + 1;
+    return votes_ >= floor(static_cast<double>(server_.peers_.size()) / 2.0) + 1;
 }
 
 raft::leader::leader(raft& server) : state(server) {
