@@ -70,7 +70,7 @@ jobs:
         run: cmake --build --preset conan-debug --parallel
 
       - name: Test
-        run: ctest --preset conan-debug --output-on-failure --notests=error
+        run: ctest --preset conan-debug --output-on-failure --no-tests=error
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
 
