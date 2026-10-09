@@ -16,6 +16,10 @@ Checks: >
   -cppcoreguidelines-non-private-member-variables-in-classes,
   -cppcoreguidelines-avoid-non-const-global-variables
 
+# Catch2's TEST_CASE uses __COUNTER__, which clang-tidy's newer Clang flags as a C2y extension under -Wpedantic.
+# The compilers we build with (GCC 14, Clang 19) accept it silently, so only clang-tidy needs the flag.
+ExtraArgs: ['-Wno-c2y-extensions']
+
 # Only report diagnostics in our own headers, not asio/CLI11/Catch2 or generated code.
 HeaderFilterRegex: '.*/include/hammurabi/.*'
 ExcludeHeaderFilterRegex: '.*/build/.*'

@@ -2,5 +2,5 @@
 #     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 conan==2.33.0
 clang-tidy==22.1.8
-clang_format==23.1.2
+clang_format==22.1.8
 ninja==1.13.2

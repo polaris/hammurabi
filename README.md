@@ -35,8 +35,13 @@ Pass these to `cmake --preset conan-debug`:
 | `-DHAMMURABI_SANITIZERS=address,undefined` | empty | Build with the given sanitizers, passed to `-fsanitize=` |
 | `-DHAMMURABI_CLANG_TIDY=ON` | `OFF` | Run clang-tidy on hammurabi's own code while compiling |
 
-Check formatting with:
+### Before pushing
+
+Run the standard check. It checks formatting, builds, and runs all tests:
 
 ```sh
-git ls-files '*.cpp' '*.h' | xargs clang-format --dry-run --Werror
+scripts/check.sh
 ```
+
+CI additionally builds with GCC, Clang and Apple Clang with warnings as errors, runs the tests under ASan and
+UBSan, and runs clang-tidy.

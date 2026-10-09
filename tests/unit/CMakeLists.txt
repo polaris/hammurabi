@@ -6,4 +6,4 @@ hammurabi_target_warnings(unit_tests)
 hammurabi_target_sanitizers(unit_tests)
 hammurabi_target_clang_tidy(unit_tests)
 
-catch_discover_tests(unit_tests)
+catch_discover_tests(unit_tests ADD_TAGS_AS_LABELS)

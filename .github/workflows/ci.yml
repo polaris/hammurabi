@@ -17,6 +17,10 @@ jobs:
             os: ubuntu-24.04
             cc: gcc-14
             cxx: g++-14
+          - name: ubuntu-24.04 / clang-19
+            os: ubuntu-24.04
+            cc: clang-19
+            cxx: clang++-19
           - name: macos-latest / apple-clang
             os: macos-latest
             cc: clang
@@ -26,12 +30,21 @@ jobs:
             cc: gcc-14
             cxx: g++-14
             sanitizers: address,undefined
+          - name: ubuntu-24.04 / clang-19 / clang-tidy
+            os: ubuntu-24.04
+            cc: clang-19
+            cxx: clang++-19
+            tidy: "ON"
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install Clang 19
+        if: matrix.cc == 'clang-19'
+        run: sudo apt-get update && sudo apt-get install -y clang-19
 
       - uses: actions/setup-python@v6
         with:
@@ -64,7 +77,7 @@ jobs:
           key: ${{ steps.conan-cache.outputs.cache-primary-key }}
 
       - name: Configure
-        run: cmake --preset conan-debug -DHAMMURABI_SANITIZERS=${{ matrix.sanitizers }}
+        run: cmake --preset conan-debug -DHAMMURABI_WARNINGS_AS_ERRORS=ON -DHAMMURABI_SANITIZERS=${{ matrix.sanitizers }} -DHAMMURABI_CLANG_TIDY=${{ matrix.tidy || 'OFF' }}
 
       - name: Build
         run: cmake --build --preset conan-debug --parallel
@@ -79,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
