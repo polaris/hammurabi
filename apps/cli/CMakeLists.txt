@@ -1,0 +1,5 @@
+add_executable(hammurabi-cli main.cpp)
+target_link_libraries(hammurabi-cli PRIVATE CLI11::CLI11 hammurabi::version)
+hammurabi_target_warnings(hammurabi-cli)
+hammurabi_target_sanitizers(hammurabi-cli)
+hammurabi_target_clang_tidy(hammurabi-cli)

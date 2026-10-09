@@ -1,0 +1,5 @@
+add_executable(hammurabi-server main.cpp)
+target_link_libraries(hammurabi-server PRIVATE asio::asio CLI11::CLI11 hammurabi::version)
+hammurabi_target_warnings(hammurabi-server)
+hammurabi_target_sanitizers(hammurabi-server)
+hammurabi_target_clang_tidy(hammurabi-server)

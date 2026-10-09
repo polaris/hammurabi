@@ -3,7 +3,7 @@ A distributed key-value store based on the Raft consensus algorithm written in m
 
 ## Building
 
-Prerequisites: a C++23 compiler (GCC 14 or Apple Clang 17), CMake 3.21 or newer, and Python 3.
+Prerequisites: a C++23 compiler (GCC 14, Clang 19 with libstdc++ 14, or Apple Clang 17), CMake 3.23 or newer, and Python 3.
 
 Conan, Ninja, clang-format and clang-tidy are installed into a virtual environment from `requirements.txt`, so everyone uses the same versions as CI.
 
@@ -16,7 +16,14 @@ cmake --build --preset conan-debug
 ctest --preset conan-debug
 ```
 
-The first `conan install` may build protobuf and abseil from source, which takes a few minutes. Later runs reuse Conan's package cache.
+If Conan has no prebuilt binary for your profile, the first `conan install` builds the dependencies from source. Later runs reuse Conan's package cache.
+
+The build produces two executables, `hammurabi-server` and `hammurabi-cli`:
+
+```sh
+./build/Debug/apps/server/hammurabi-server --version
+./build/Debug/apps/cli/hammurabi-cli --help
+```
 
 ### Build options
 

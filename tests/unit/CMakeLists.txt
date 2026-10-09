@@ -1,0 +1,9 @@
+include(Catch)
+
+add_executable(unit_tests tests.cpp)
+target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain)
+hammurabi_target_warnings(unit_tests)
+hammurabi_target_sanitizers(unit_tests)
+hammurabi_target_clang_tidy(unit_tests)
+
+catch_discover_tests(unit_tests)

@@ -16,6 +16,7 @@ Checks: >
   -cppcoreguidelines-non-private-member-variables-in-classes,
   -cppcoreguidelines-avoid-non-const-global-variables
 
-# Only report diagnostics in our own headers, not asio/protobuf/Catch2 or generated code.
+# Only report diagnostics in our own headers, not asio/CLI11/Catch2 or generated code.
 HeaderFilterRegex: '.*/include/hammurabi/.*'
+ExcludeHeaderFilterRegex: '.*/build/.*'
 ...
