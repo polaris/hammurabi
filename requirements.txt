@@ -1,6 +1,8 @@
 # Development tools. Create the environment with:
 #     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 conan==2.33.0
-clang-tidy==22.1.8
+# clang-tidy parses the code with its own built-in Clang, so it must match the CI compiler (clang-19).
+# A newer one fails on code clang-19 compiles fine, e.g. clang-tidy 22 on libstdc++ 14's ranges::to pipe.
+clang-tidy==19.1.0.1
 clang_format==22.1.8
 ninja==1.13.2
