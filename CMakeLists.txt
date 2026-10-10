@@ -24,6 +24,7 @@ target_include_directories(hammurabi_version INTERFACE "${PROJECT_BINARY_DIR}/in
 
 add_subdirectory(apps/cli)
 add_subdirectory(apps/server)
+add_subdirectory(src/wire)
 
 if(BUILD_TESTING)
     find_package(Catch2 3 REQUIRED)
