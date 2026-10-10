@@ -1,3 +1,8 @@
-add_library(hammurabi_raft INTERFACE)
+add_library(hammurabi_raft STATIC codec.cpp)
 
-target_include_directories(hammurabi_raft INTERFACE ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(hammurabi_raft PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(hammurabi_raft PUBLIC hammurabi_wire)
+
+hammurabi_target_warnings(hammurabi_raft)
+hammurabi_target_sanitizers(hammurabi_raft)
+hammurabi_target_clang_tidy(hammurabi_raft)
