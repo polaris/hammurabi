@@ -26,7 +26,7 @@ struct append_entries {
     term_t term = 0;
     log_index prev_log_index = 0;
     term_t prev_log_term = 0;
-    std::vector<log_entry> entries;
+    std::vector<log_entry> entries{};
     log_index leader_commit = 0;
     bool operator==(const append_entries&) const = default;
 };
@@ -44,7 +44,7 @@ using message = std::variant<request_vote, request_vote_reply, append_entries, a
 struct envelope {
     node_id from = 0;
     node_id to = 0;
-    message msg;
+    message msg{};
     bool operator==(const envelope&) const = default;
 };
 

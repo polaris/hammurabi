@@ -16,7 +16,7 @@ enum class entry_kind : std::uint8_t { noop = 1, command = 2 };
 struct log_entry {
     term_t term = 0;
     entry_kind kind = entry_kind::command;
-    std::vector<std::byte> data; // the encoded kv command; empty for noop
+    std::vector<std::byte> data{}; // the encoded kv command; empty for noop
     bool operator==(const log_entry&) const = default;
 };
 
