@@ -1,0 +1,8 @@
+add_library(hammurabi_kv STATIC state_machine.cpp)
+
+target_include_directories(hammurabi_kv PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(hammurabi_kv PUBLIC hammurabi_wire)
+
+hammurabi_target_warnings(hammurabi_kv)
+hammurabi_target_sanitizers(hammurabi_kv)
+hammurabi_target_clang_tidy(hammurabi_kv)

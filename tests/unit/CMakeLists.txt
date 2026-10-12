@@ -1,7 +1,11 @@
 include(Catch)
 
-add_executable(unit_tests codec_tests.cpp raft_messages_tests.cpp raft_codec_tests.cpp)
-target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain hammurabi_raft)
+add_executable(unit_tests codec_tests.cpp
+                          raft_messages_tests.cpp
+                          raft_codec_tests.cpp
+                          kv_tests.cpp)
+target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain hammurabi_raft
+                                                                hammurabi_kv)
 hammurabi_target_warnings(unit_tests)
 hammurabi_target_sanitizers(unit_tests)
 hammurabi_target_clang_tidy(unit_tests)
