@@ -102,6 +102,11 @@ private:
         std::map<node_id, log_index> match_index;
     };
 
+    void handle(node_id from, const request_vote& m);
+    void handle(node_id from, const request_vote_reply& m);
+    void handle(node_id from, const append_entries& m);
+    void handle(node_id from, const append_entries_reply& m);
+
     void become_follower(term_t term, std::optional<node_id> leader);
     void become_candidate();
     void become_leader_if_won();

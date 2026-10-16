@@ -4,7 +4,9 @@
 #include <hammurabi/raft/node.h>
 
 #include <cassert>
+#include <optional>
 #include <utility>
+#include <variant>
 
 namespace hammurabi::raft {
 
@@ -48,9 +50,47 @@ void node::tick() {
     }
 }
 
-// void node::receive(const envelope& env) {
+void node::receive(const envelope& env) {
+    const term_t msg_term = std::visit([](const auto& m) { return m.term; }, env.msg);
+    if (msg_term > hard_.term) {
+        become_follower(msg_term, std::nullopt);
+    }
+    std::visit([&](const auto& m) { handle(env.from, m); }, env.msg);
+}
 
-// }
+void node::handle(node_id from, const request_vote& m) {
+    // §5.4.1: only vote for a candidate whose log is at least as up to date as ours.
+    // "Up to date" compares the last term first, then the last index.
+    const bool log_ok =
+        std::pair{m.last_log_term, m.last_log_index} >= std::pair{term_at(last_log_index()), last_log_index()};
+    const bool can_vote = !hard_.voted_for || *hard_.voted_for == from; // "== from": a duplicate request
+    const bool grant = m.term == hard_.term && can_vote && log_ok;
+    if (grant) {
+        hard_.voted_for = from;
+        storage_->save_hard_state(hard_); // persist BEFORE the reply leaves (section 5.7)
+        reset_election_timer();           // don't start a competing election right after voting
+    }
+    send(from, request_vote_reply{.term = hard_.term, .granted = grant});
+}
+
+void node::handle(node_id from, const request_vote_reply& m) {
+    (void)from;
+    (void)m;
+}
+
+void node::handle(node_id from, const append_entries& m) {
+    assert(!(std::holds_alternative<leader_state>(role_) && m.term == current_term()));
+    const bool success = m.term >= current_term();
+    if (success) {
+        become_follower(m.term, from);
+    }
+    send(from, append_entries_reply{.term = current_term(), .success = success});
+}
+
+void node::handle(node_id from, const append_entries_reply& m) {
+    (void)from;
+    (void)m;
+}
 
 // std::expected<log_index, not_leader> node::propose(std::vector<std::byte> command) {
 
@@ -76,6 +116,16 @@ term_t node::current_term() const {
 // std::optional<node_id> node::leader_hint() const;
 // log_index node::commit_index() const;
 // std::span<const log_entry> node::log() const;
+
+void node::become_follower(term_t term, std::optional<node_id> leader) {
+    reset_election_timer();
+    role_ = follower_state{.leader = leader};
+    if (term > current_term()) {
+        hard_.voted_for = std::nullopt;
+        hard_.term = term;
+        storage_->save_hard_state(hard_);
+    }
+}
 
 void node::become_candidate() {
     reset_election_timer();
