@@ -84,12 +84,12 @@ void node::become_candidate() {
     hard_.voted_for = cfg_.self;
     storage_->save_hard_state(hard_);
     const auto lli = last_log_index();
-    for (const auto node_id : cfg_.members) {
-        if (node_id == cfg_.self) {
+    for (const auto peer : cfg_.members) {
+        if (peer == cfg_.self) {
             continue;
         }
         const message msg = request_vote{.term = current_term(), .last_log_index = lli, .last_log_term = term_at(lli)};
-        send(node_id, msg);
+        send(peer, msg);
     }
     become_leader_if_won();
 }
@@ -125,11 +125,11 @@ void node::send(node_id to, message msg) {
 }
 
 void node::broadcast_heartbeat() {
-    for (const auto node_id : cfg_.members) {
-        if (node_id == cfg_.self) {
+    for (const auto peer : cfg_.members) {
+        if (peer == cfg_.self) {
             continue;
         }
-        const auto prev_log_index = std::get<leader_state>(role_).next_index.at(node_id) - 1;
+        const auto prev_log_index = std::get<leader_state>(role_).next_index.at(peer) - 1;
         const message msg = append_entries{
             .term = current_term(),
             .prev_log_index = prev_log_index,
@@ -137,7 +137,7 @@ void node::broadcast_heartbeat() {
             .entries = {},
             .leader_commit = commit_index_,
         };
-        send(node_id, msg);
+        send(peer, msg);
     }
 }
 
