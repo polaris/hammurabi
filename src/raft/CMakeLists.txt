@@ -1,4 +1,4 @@
-add_library(hammurabi_raft STATIC codec.cpp)
+add_library(hammurabi_raft STATIC codec.cpp node.cpp)
 
 target_include_directories(hammurabi_raft PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(hammurabi_raft PUBLIC hammurabi_wire)

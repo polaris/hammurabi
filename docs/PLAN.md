@@ -1013,7 +1013,7 @@ struct output {
 
 class node {
 public:
-    node(config cfg, storage& store);  // loads persistent state from store
+    node(config cfg, storage* store);  // loads persistent state from store
 
     void tick();
     void receive(const envelope& env);
@@ -1033,15 +1033,17 @@ private:
 
     void become_follower(term_t term, std::optional<node_id> leader);
     void become_candidate();
+    void become_leader_if_won();         // become_leader() once the votes are a majority
     void become_leader();
     void reset_election_timer();         // picks a new random timeout
     void send(node_id to, message msg);  // appends to out_.messages
+    void broadcast_heartbeat();          // step 2.3
     [[nodiscard]] std::size_t majority() const { return cfg_.members.size() / 2 + 1; }
     [[nodiscard]] log_index last_log_index() const { return log_.size(); }
     [[nodiscard]] term_t term_at(log_index index) const;  // 0 for index 0
 
     config cfg_;
-    storage& storage_;
+    storage* storage_;             // a pointer: clang-tidy flags reference members
     std::mt19937_64 rng_;
     hard_state hard_;              // persistent
     std::vector<log_entry> log_;   // persistent; entry with index i lives at log_[i - 1]
@@ -1073,10 +1075,11 @@ void node::tick() {
 ```
 
 `become_candidate()` does the following:
-- Increment the term, vote for itself, and **persist** (`storage_.save_hard_state`).
+- Increment the term, vote for itself, and **persist** (`storage_->save_hard_state`).
 - Set `role_ = candidate_state{.votes = {cfg_.self}}` and reset the election timer.
 - Send `request_vote` to every other member.
-- If its own vote is already a majority (a one-node cluster), call `become_leader()` immediately.
+- Call `become_leader_if_won()`: if its own vote is already a majority (a one-node cluster), it becomes
+  leader immediately.
 
 **Why this way:**
 - The node keeps its own copy of the log in memory (`log_`) and uses `storage` only as a "write-through
@@ -1126,7 +1129,7 @@ void node::handle(node_id from, const request_vote& m) {
     const bool grant = m.term == hard_.term && can_vote && log_ok;
     if (grant) {
         hard_.voted_for = from;
-        storage_.save_hard_state(hard_);   // persist BEFORE the reply leaves (section 5.7)
+        storage_->save_hard_state(hard_);  // persist BEFORE the reply leaves (section 5.7)
         reset_election_timer();            // don't start a competing election right after voting
     }
     send(from, request_vote_reply{.term = hard_.term, .granted = grant});
@@ -1163,9 +1166,9 @@ leaders and candidates step down.
 
 **Build:**
 - `handle(request_vote_reply)`: if candidate and `m.term == hard_.term` and `m.granted`, insert `from` into
-  `votes`. If `votes.size() >= majority()`, call `become_leader()`.
+  `votes` and call `become_leader_if_won()`.
 - `become_leader()`: set up `leader_state` (next index = last index + 1, match index = 0 for every peer) and
-  send heartbeats immediately.
+  send heartbeats immediately (`broadcast_heartbeat()`).
 - Heartbeat: `append_entries` with no entries. `prev_log_index`/`prev_log_term` are taken from `next_index`.
 - `handle(append_entries)` (simple version; phase 4 adds the log part):
   - If `m.term < hard_.term`, reply `success = false`.
@@ -1304,7 +1307,7 @@ up to that point.
 **Build:**
 - `propose(data)`: if not leader, return `std::unexpected{not_leader{leader_hint()}}`. Otherwise:
   1. Create `log_entry{.term = hard_.term, .kind = entry_kind::command, .data = std::move(data)}`.
-  2. Call `storage_.append` and push the entry onto `log_`.
+  2. Call `storage_->append` and push the entry onto `log_`.
   3. Send `append_entries` to every peer and return the new index.
 - `send_append_entries(peer)`: send the entries from `next_index[peer]` to the end, with `prev_log_index =
   next_index − 1` and `prev_log_term = term_at(prev_log_index)`. Heartbeats call the same function and
