@@ -27,13 +27,13 @@ struct config {
 
 struct hard_state {
     term_t term = 0;
-    std::optional<node_id> voted_for;
+    std::optional<node_id> voted_for{};
     bool operator==(const hard_state&) const = default;
 };
 
 struct persistent_state {
-    hard_state hard;
-    std::vector<log_entry> log;
+    hard_state hard{};
+    std::vector<log_entry> log{};
 };
 
 class storage {
@@ -67,12 +67,12 @@ private:
 
 enum class role : std::uint8_t { follower, candidate, leader };
 struct not_leader {
-    std::optional<node_id> leader_hint;
+    std::optional<node_id> leader_hint{};
 };
 
 struct output {
-    std::vector<envelope> messages;
-    std::vector<std::pair<log_index, log_entry>> committed;
+    std::vector<envelope> messages{};
+    std::vector<std::pair<log_index, log_entry>> committed{};
 };
 
 class node {
