@@ -74,8 +74,10 @@ void node::handle(node_id from, const request_vote& m) {
 }
 
 void node::handle(node_id from, const request_vote_reply& m) {
-    (void)from;
-    (void)m;
+    if (auto* cs = std::get_if<candidate_state>(&role_); cs != nullptr && m.term == hard_.term && m.granted) {
+        cs->votes.insert(from);
+        become_leader_if_won();
+    }
 }
 
 void node::handle(node_id from, const append_entries& m) {
@@ -113,7 +115,13 @@ term_t node::current_term() const {
     return hard_.term;
 }
 
-// std::optional<node_id> node::leader_hint() const;
+std::optional<node_id> node::leader_hint() const {
+    if (auto* fs = std::get_if<follower_state>(&role_); fs != nullptr) {
+        return fs->leader;
+    }
+    return std::nullopt;
+}
+
 // log_index node::commit_index() const;
 // std::span<const log_entry> node::log() const;
 

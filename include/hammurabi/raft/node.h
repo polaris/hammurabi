@@ -89,6 +89,7 @@ public:
     [[nodiscard]] std::optional<node_id> leader_hint() const;
     [[nodiscard]] log_index commit_index() const;
     [[nodiscard]] std::span<const log_entry> log() const;
+    [[nodiscard]] node_id id() const { return cfg_.self; }
 
 private:
     struct follower_state {

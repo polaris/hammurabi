@@ -5,6 +5,8 @@
 #include <hammurabi/raft/types.h>
 
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>
@@ -45,6 +47,56 @@ request_vote_reply ask_for_vote(node& n, const envelope& request) {
     REQUIRE(output.messages[0].to == request.from);
     REQUIRE(std::holds_alternative<request_vote_reply>(output.messages[0].msg));
     return std::get<request_vote_reply>(output.messages[0].msg);
+}
+
+void deliver_all(std::vector<node>& nodes) {
+    while (true) {
+        std::vector<envelope> in_flight;
+        for (auto& n : nodes) {
+            auto output = n.take_output();
+            in_flight.insert(in_flight.end(), output.messages.begin(), output.messages.end());
+        }
+        for (const auto& env : in_flight) {
+            assert(env.to >= 1 && env.to <= nodes.size()); // node ids are 1..N in vector order
+            nodes[env.to - 1].receive(env);
+        }
+        if (in_flight.empty()) {
+            return;
+        }
+    }
+}
+
+struct stable_leader {
+    int ticks = 0;
+    std::size_t leader{}; // index into nodes
+    std::vector<std::size_t> followers{};
+};
+
+// Ticks every node and delivers all messages until there is one leader and
+// everyone else is a follower. Returns nullopt if that doesn't happen within
+// the limit.
+std::optional<stable_leader> ticks_until_stable_leader(std::vector<node>& nodes, int limit = 100) {
+    for (int i = 1; i <= limit; ++i) {
+        for (auto& n : nodes) {
+            n.tick();
+        }
+        deliver_all(nodes);
+        bool leader_elected = false;
+        std::vector<std::size_t> followers;
+        std::size_t leader = 0;
+        for (std::size_t j = 0; j < nodes.size(); ++j) {
+            if (nodes[j].current_role() == role::leader) {
+                leader_elected = true;
+                leader = j;
+            } else if (nodes[j].current_role() == role::follower) {
+                followers.push_back(j);
+            }
+        }
+        if (leader_elected && followers.size() == nodes.size() - 1) {
+            return stable_leader{.ticks = i, .leader = leader, .followers = followers};
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -283,4 +335,97 @@ TEST_CASE("leader refuses append_entries from an older term", "[election]") {
     REQUIRE(output.messages.size() == 1);
     REQUIRE(std::get<append_entries_reply>(output.messages[0].msg).success == false);
     REQUIRE(std::get<append_entries_reply>(output.messages[0].msg).term == 6);
+}
+
+TEST_CASE("exactly one leader", "[election]") {
+    memory_storage store1, store2, store3;
+    std::vector<node> nodes = {
+        node{make_config(1, {1, 2, 3}, 42), &store1},
+        node{make_config(2, {1, 2, 3}, 67), &store2},
+        node{make_config(3, {1, 2, 3}, 12), &store3},
+    };
+
+    const auto sl = ticks_until_stable_leader(nodes);
+    REQUIRE(sl.has_value());
+
+    for (const auto f : sl->followers) {
+        REQUIRE(nodes[f].leader_hint() == nodes[sl->leader].id());
+    }
+    REQUIRE(nodes[0].current_term() == nodes[1].current_term());
+    REQUIRE(nodes[0].current_term() == nodes[2].current_term());
+}
+
+TEST_CASE("heartbeats prevent elections over 1000 ticks", "[election]") {
+    memory_storage store1, store2, store3;
+    std::vector<node> nodes = {
+        node{make_config(1, {1, 2, 3}, 42), &store1},
+        node{make_config(2, {1, 2, 3}, 67), &store2},
+        node{make_config(3, {1, 2, 3}, 12), &store3},
+    };
+
+    const auto sl = ticks_until_stable_leader(nodes);
+    REQUIRE(sl.has_value());
+    const auto& leader = nodes[sl->leader];
+    const auto term = leader.current_term();
+
+    // deliver_all drains every message, so a whole election can start and finish
+    // within one iteration. Watching for candidates would miss it; a new term can't.
+    for (int i = 1; i <= 1000; ++i) {
+        for (auto& n : nodes) {
+            n.tick();
+        }
+        deliver_all(nodes);
+        CAPTURE(i);
+        REQUIRE(leader.current_role() == role::leader);
+        for (const auto& n : nodes) {
+            REQUIRE(n.current_term() == term);
+        }
+    }
+}
+
+TEST_CASE("leaders and candidates step down when they see a higher term", "[election]") {
+    memory_storage store1, store2, store3;
+    std::vector<node> nodes = {
+        node{make_config(1, {1, 2, 3}, 42), &store1},
+        node{make_config(2, {1, 2, 3}, 67), &store2},
+        node{make_config(3, {1, 2, 3}, 12), &store3},
+    };
+
+    const auto sl = ticks_until_stable_leader(nodes);
+    REQUIRE(sl.has_value());
+
+    auto& leader = nodes[sl->leader];
+    auto& follower = nodes[sl->followers[0]];
+
+    SECTION("leader") {
+        // A request_vote, not append_entries: the step-down rule in receive() covers every message type.
+        const auto new_term = leader.current_term() + 1;
+        leader.receive(envelope{.from = follower.id(), .to = leader.id(), .msg = request_vote{.term = new_term}});
+
+        REQUIRE(leader.current_role() == role::follower);
+        REQUIRE(leader.current_term() == new_term);
+    }
+
+    SECTION("candidate") {
+        REQUIRE(ticks_until_election(follower) != -1);
+        const auto new_term = follower.current_term() + 1;
+        follower.receive(envelope{.from = leader.id(), .to = follower.id(), .msg = append_entries{.term = new_term}});
+
+        REQUIRE(follower.current_role() == role::follower);
+        REQUIRE(follower.current_term() == new_term);
+    }
+}
+
+TEST_CASE("a reply delivered twice is still one vote", "[election]") {
+    memory_storage store;
+    node n{make_config(1, {1, 2, 3, 4, 5}, 42), &store};
+
+    ticks_until_election(n);
+    REQUIRE(n.current_role() == role::candidate);
+    n.receive(envelope{.from = 2, .to = 1, .msg = request_vote_reply{.term = n.current_term(), .granted = true}});
+    REQUIRE(n.current_role() == role::candidate);
+    n.receive(envelope{.from = 2, .to = 1, .msg = request_vote_reply{.term = n.current_term(), .granted = true}});
+    REQUIRE(n.current_role() == role::candidate);
+    n.receive(envelope{.from = 3, .to = 1, .msg = request_vote_reply{.term = n.current_term(), .granted = true}});
+    REQUIRE(n.current_role() == role::leader);
 }
