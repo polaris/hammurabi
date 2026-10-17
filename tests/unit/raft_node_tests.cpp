@@ -73,9 +73,10 @@ struct stable_leader {
 };
 
 // Ticks every node and delivers all messages until there is one leader and
-// everyone else is a follower. Returns nullopt if that doesn't happen within
-// the limit.
-std::optional<stable_leader> ticks_until_stable_leader(std::vector<node>& nodes, int limit = 100) {
+// everyone else is a follower. Fails the test if that doesn't happen within
+// the limit. (Not an optional + REQUIRE at the call site: clang-tidy can't see
+// that a failed REQUIRE ends the test, so it flags every access after it.)
+stable_leader ticks_until_stable_leader(std::vector<node>& nodes, int limit = 100) {
     for (int i = 1; i <= limit; ++i) {
         for (auto& n : nodes) {
             n.tick();
@@ -96,7 +97,8 @@ std::optional<stable_leader> ticks_until_stable_leader(std::vector<node>& nodes,
             return stable_leader{.ticks = i, .leader = leader, .followers = followers};
         }
     }
-    return std::nullopt;
+    FAIL("no stable leader within " << limit << " ticks");
+    return {}; // unreachable: FAIL throws, but the compiler can't see that either
 }
 
 } // namespace
@@ -346,10 +348,9 @@ TEST_CASE("exactly one leader", "[election]") {
     };
 
     const auto sl = ticks_until_stable_leader(nodes);
-    REQUIRE(sl.has_value());
 
-    for (const auto f : sl->followers) {
-        REQUIRE(nodes[f].leader_hint() == nodes[sl->leader].id());
+    for (const auto f : sl.followers) {
+        REQUIRE(nodes[f].leader_hint() == nodes[sl.leader].id());
     }
     REQUIRE(nodes[0].current_term() == nodes[1].current_term());
     REQUIRE(nodes[0].current_term() == nodes[2].current_term());
@@ -364,8 +365,7 @@ TEST_CASE("heartbeats prevent elections over 1000 ticks", "[election]") {
     };
 
     const auto sl = ticks_until_stable_leader(nodes);
-    REQUIRE(sl.has_value());
-    const auto& leader = nodes[sl->leader];
+    const auto& leader = nodes[sl.leader];
     const auto term = leader.current_term();
 
     // deliver_all drains every message, so a whole election can start and finish
@@ -392,10 +392,9 @@ TEST_CASE("leaders and candidates step down when they see a higher term", "[elec
     };
 
     const auto sl = ticks_until_stable_leader(nodes);
-    REQUIRE(sl.has_value());
 
-    auto& leader = nodes[sl->leader];
-    auto& follower = nodes[sl->followers[0]];
+    auto& leader = nodes[sl.leader];
+    auto& follower = nodes[sl.followers[0]];
 
     SECTION("leader") {
         // A request_vote, not append_entries: the step-down rule in receive() covers every message type.
