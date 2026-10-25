@@ -1,16 +1,37 @@
 #include "sim/cluster.h"
 
+#include "sim/invariant_checker.h"
 #include "sim/types.h"
 
 #include <hammurabi/raft/format.h>
 #include <hammurabi/raft/node.h>
 #include <hammurabi/raft/types.h>
 
+#include <algorithm>
 #include <format>
+#include <optional>
 #include <ranges>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace hammurabi::sim {
+
+namespace {
+
+std::string_view role_name(raft::role r) {
+    switch (r) {
+        case raft::role::follower:
+            return "follower";
+        case raft::role::candidate:
+            return "candidate";
+        case raft::role::leader:
+            return "leader";
+    }
+    std::unreachable();
+}
+
+} // namespace
 
 cluster::cluster(std::size_t size, std::uint64_t seed) : seeder_{seed}, net_{seeder_()} {
     const auto members =
@@ -43,6 +64,15 @@ void cluster::step() {
             net_.send(std::move(packet), now_);
         }
     }
+    for (const auto& [id, n] : nodes_) {
+        if (n->current_role() == raft::role::leader) {
+            try {
+                invariant_checker_.observe_leader(id, n->current_term(), now_);
+            } catch (const invariant_violation& e) {
+                throw invariant_violation{std::format("{}\n{}", e.what(), history())};
+            }
+        }
+    }
 }
 
 void cluster::run_for(tick_t ticks) {
@@ -73,6 +103,18 @@ std::optional<raft::node_id> cluster::leader() const {
     return result;
 }
 
+bool cluster::has_stable_leader() const {
+    const auto l = leader();
+    if (!l) {
+        return false;
+    }
+    const auto term = nodes_.at(*l)->current_term();
+    return std::ranges::all_of(nodes_, [&](const auto& entry) {
+        const auto& [id, n] = entry;
+        return n->current_term() == term && (id == *l || n->current_role() == raft::role::follower);
+    });
+}
+
 raft::node& cluster::node(raft::node_id id) {
     return *nodes_.at(id);
 }
@@ -90,6 +132,14 @@ std::string cluster::history() const {
     for (const auto& s : history_) {
         result += s;
         result += "\n";
+    }
+    return result;
+}
+
+std::string cluster::describe() const {
+    std::string result;
+    for (const auto& [id, n] : nodes_) {
+        result += std::format("{}: {} t={}\n", id, role_name(n->current_role()), n->current_term());
     }
     return result;
 }

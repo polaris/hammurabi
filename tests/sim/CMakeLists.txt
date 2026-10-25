@@ -1,6 +1,7 @@
 include(Catch)
 
-add_library(hammurabi_sim STATIC cluster.cpp)
+add_library(hammurabi_sim STATIC cluster.cpp
+                                 invariant_checker.cpp)
 
 target_include_directories(hammurabi_sim PUBLIC ${PROJECT_SOURCE_DIR}/tests)
 target_link_libraries(hammurabi_sim PUBLIC hammurabi_raft)
