@@ -3,10 +3,14 @@
 
 #include <hammurabi/raft/node.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cstddef>
+#include <expected>
 #include <optional>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace hammurabi::raft {
 
@@ -43,7 +47,7 @@ void node::tick() {
     if (std::holds_alternative<leader_state>(role_)) {
         if (++heartbeat_elapsed_ >= cfg_.heartbeat_interval_ticks) {
             heartbeat_elapsed_ = 0;
-            broadcast_heartbeat();
+            broadcast_append_entries();
         }
     } else if (++election_elapsed_ >= election_timeout_) {
         become_candidate();
@@ -51,12 +55,36 @@ void node::tick() {
 }
 
 void node::receive(const envelope& env) {
-    const term_t msg_term = std::visit([](const auto& m) { return m.term; }, env.msg);
-    if (msg_term > hard_.term) {
-        become_follower(msg_term, std::nullopt);
-    }
-    std::visit([&](const auto& m) { handle(env.from, m); }, env.msg);
+    std::visit(
+        [&](const auto& m) {
+            if (m.term > hard_.term) {
+                adopt_term(m.term); // Figure 2, "Rules for All Servers"
+            }
+            if (m.term < hard_.term) {
+                reject_stale(env.from, m); // Figure 2: "Reply false if term < currentTerm"
+                return;
+            }
+            handle(env.from, m); // from here on: m.term == hard_.term
+        },
+        env.msg);
 }
+
+void node::reject_stale(node_id from, const request_vote& /*m*/) {
+    send(from, request_vote_reply{.term = hard_.term, .granted = false});
+}
+
+void node::reject_stale(node_id /*from*/, const request_vote_reply& /*m*/) {} // a reply from an old term: drop
+
+void node::reject_stale(node_id from, const append_entries& /*m*/) {
+    send(from, append_entries_reply{
+                   .term = hard_.term,
+                   .success = false,
+                   .match_index = 0,
+                   .last_log_index = last_log_index(),
+               });
+}
+
+void node::reject_stale(node_id /*from*/, const append_entries_reply& /*m*/) {} // a reply from an old term: drop
 
 void node::handle(node_id from, const request_vote& m) {
     // §5.4.1: only vote for a candidate whose log is at least as up to date as ours.
@@ -64,7 +92,7 @@ void node::handle(node_id from, const request_vote& m) {
     const bool log_ok =
         std::pair{m.last_log_term, m.last_log_index} >= std::pair{term_at(last_log_index()), last_log_index()};
     const bool can_vote = !hard_.voted_for || *hard_.voted_for == from; // "== from": a duplicate request
-    const bool grant = m.term == hard_.term && can_vote && log_ok;
+    const bool grant = can_vote && log_ok;
     if (grant) {
         hard_.voted_for = from;
         storage_->save_hard_state(hard_); // persist BEFORE the reply leaves (section 5.7)
@@ -74,29 +102,105 @@ void node::handle(node_id from, const request_vote& m) {
 }
 
 void node::handle(node_id from, const request_vote_reply& m) {
-    if (auto* cs = std::get_if<candidate_state>(&role_); cs != nullptr && m.term == hard_.term && m.granted) {
+    if (auto* cs = std::get_if<candidate_state>(&role_); cs != nullptr && m.granted) {
         cs->votes.insert(from);
         become_leader_if_won();
     }
 }
 
 void node::handle(node_id from, const append_entries& m) {
-    assert(!(std::holds_alternative<leader_state>(role_) && m.term == current_term()));
-    const bool success = m.term >= current_term();
-    if (success) {
-        become_follower(m.term, from);
+    assert(!std::holds_alternative<leader_state>(role_)); // Election Safety: two leaders in one term
+    become_follower(from);                                // §5.2: also ends a candidacy in this term
+
+    // 1. Consistency check: do we have the entry the new entries follow?
+    if (m.prev_log_index > last_log_index() || term_at(m.prev_log_index) != m.prev_log_term) {
+        send(from, append_entries_reply{
+                       .term = hard_.term,
+                       .success = false,
+                       .match_index = 0,
+                       .last_log_index = last_log_index(),
+                   });
+        return;
     }
-    send(from, append_entries_reply{.term = current_term(), .success = success});
+
+    // 2. Skip entries we already have. Stop at the first new or conflicting one.
+    auto first_new = m.entries.begin();
+    log_index index = m.prev_log_index + 1;
+    while (first_new != m.entries.end() && index <= last_log_index() && term_at(index) == first_new->term) {
+        ++first_new;
+        ++index;
+    }
+    if (first_new != m.entries.end()) {
+        if (index <= last_log_index()) {
+            truncate_log_from(index); // conflict: drop it and everything after (persisted)
+        }
+        append_to_log(std::span{first_new, m.entries.end()}); // persisted, then added to log_
+    }
+
+    // 3. Commit what the leader has committed, but only as far as we have verified (step 4.3).
+    const log_index last_verified = m.prev_log_index + m.entries.size();
+    advance_commit_index(std::min(m.leader_commit, last_verified));
+
+    send(from, append_entries_reply{
+                   .term = hard_.term,
+                   .success = true,
+                   .match_index = last_verified,
+                   .last_log_index = last_log_index(),
+               });
 }
 
-void node::handle(node_id from, const append_entries_reply& m) {
-    (void)from;
-    (void)m;
+void node::truncate_log_from(log_index index) {
+    assert(index >= 1);
+    storage_->truncate(index);
+    log_.resize(index - 1);
 }
 
-// std::expected<log_index, not_leader> node::propose(std::vector<std::byte> command) {
+void node::append_to_log(std::span<const log_entry> entries) {
+    storage_->append(entries);
+    log_.insert(log_.end(), entries.begin(), entries.end());
+}
 
-// }
+void node::advance_commit_index(log_index index) {
+    if (index > commit_index_) {
+        commit_index_ = index;
+    }
+}
+
+void node::handle(node_id /*from*/, const append_entries_reply& /*m*/) {} // step 4.2
+
+std::expected<log_index, not_leader> node::propose(std::vector<std::byte> command) {
+    if (current_role() != role::leader) {
+        return std::unexpected{not_leader{.leader_hint = leader_hint()}};
+    }
+    const log_entry e{.term = current_term(), .kind = entry_kind::command, .data = std::move(command)};
+    append_to_log(std::span{&e, 1});
+    broadcast_append_entries();
+    return last_log_index();
+}
+
+void node::send_append_entries(node_id peer) {
+    const auto next_log_index = std::get<leader_state>(role_).next_index.at(peer);
+    assert(next_log_index <= last_log_index() + 1);
+    const auto prev_log_index = next_log_index - 1;
+    const auto entries = log().subspan(next_log_index - 1);
+    message msg = append_entries{
+        .term = current_term(),
+        .prev_log_index = prev_log_index,
+        .prev_log_term = term_at(prev_log_index),
+        .entries = std::vector<log_entry>(entries.begin(), entries.end()),
+        .leader_commit = commit_index_,
+    };
+    send(peer, std::move(msg));
+}
+
+void node::broadcast_append_entries() {
+    for (const auto peer : cfg_.members) {
+        if (peer == cfg_.self) {
+            continue;
+        }
+        send_append_entries(peer);
+    }
+}
 
 output node::take_output() {
     return std::exchange(out_, {});
@@ -122,17 +226,25 @@ std::optional<node_id> node::leader_hint() const {
     return std::nullopt;
 }
 
-// log_index node::commit_index() const;
-// std::span<const log_entry> node::log() const;
+log_index node::commit_index() const {
+    return commit_index_;
+}
 
-void node::become_follower(term_t term, std::optional<node_id> leader) {
+std::span<const log_entry> node::log() const {
+    return log_;
+}
+
+void node::adopt_term(term_t term) {
+    assert(term > hard_.term);
+    hard_.term = term;
+    hard_.voted_for = std::nullopt;
+    storage_->save_hard_state(hard_);
+    become_follower(std::nullopt); // the leader of the new term is not known yet
+}
+
+void node::become_follower(std::optional<node_id> leader) {
     reset_election_timer();
     role_ = follower_state{.leader = leader};
-    if (term > current_term()) {
-        hard_.voted_for = std::nullopt;
-        hard_.term = term;
-        storage_->save_hard_state(hard_);
-    }
 }
 
 void node::become_candidate() {
@@ -169,7 +281,7 @@ void node::become_leader() {
     }
     role_ = std::move(ls);
     heartbeat_elapsed_ = 0;
-    broadcast_heartbeat();
+    broadcast_append_entries();
 }
 
 void node::reset_election_timer() {
@@ -180,23 +292,6 @@ void node::reset_election_timer() {
 
 void node::send(node_id to, message msg) {
     out_.messages.push_back(envelope{.from = cfg_.self, .to = to, .msg = std::move(msg)});
-}
-
-void node::broadcast_heartbeat() {
-    for (const auto peer : cfg_.members) {
-        if (peer == cfg_.self) {
-            continue;
-        }
-        const auto prev_log_index = std::get<leader_state>(role_).next_index.at(peer) - 1;
-        const message msg = append_entries{
-            .term = current_term(),
-            .prev_log_index = prev_log_index,
-            .prev_log_term = term_at(prev_log_index),
-            .entries = {},
-            .leader_commit = commit_index_,
-        };
-        send(peer, msg);
-    }
 }
 
 term_t node::term_at(log_index index) const {

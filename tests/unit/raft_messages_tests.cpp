@@ -1,3 +1,5 @@
+#include "raft_string_makers.h" // IWYU pragma: keep
+
 #include <catch2/catch_test_macros.hpp>
 #include <hammurabi/raft/format.h>
 #include <hammurabi/raft/messages.h>

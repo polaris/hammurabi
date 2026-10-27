@@ -1,3 +1,5 @@
+#include "raft_string_makers.h" // IWYU pragma: keep
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <hammurabi/raft/messages.h>
@@ -37,6 +39,15 @@ int ticks_until_election(node& n, int limit = 100) {
 
 log_entry entry(term_t term) {
     return log_entry{.term = term};
+}
+
+std::vector<log_entry> log_of(const std::vector<term_t>& terms) {
+    std::vector<log_entry> entries;
+    entries.reserve(terms.size());
+    for (const auto term : terms) {
+        entries.push_back(entry(term));
+    }
+    return entries;
 }
 
 request_vote_reply ask_for_vote(node& n, const envelope& request) {
@@ -99,6 +110,14 @@ stable_leader ticks_until_stable_leader(std::vector<node>& nodes, int limit = 10
     }
     FAIL("no stable leader within " << limit << " ticks");
     return {}; // unreachable: FAIL throws, but the compiler can't see that either
+}
+
+// Makes node 1 of {1, 2, 3} leader of term 1 and drops its output (request_votes, first heartbeats).
+void elect(node& n) {
+    REQUIRE(ticks_until_election(n) != -1);
+    n.receive(envelope{.from = 2, .to = 1, .msg = request_vote_reply{.term = n.current_term(), .granted = true}});
+    REQUIRE(n.current_role() == role::leader);
+    (void)n.take_output(); // take_output is [[nodiscard]]
 }
 
 } // namespace
@@ -333,10 +352,9 @@ TEST_CASE("leader refuses append_entries from an older term", "[election]") {
     REQUIRE(n.current_term() == 6);
 
     n.receive(envelope{.from = 2, .to = 1, .msg = append_entries{.term = 5}});
-    const auto output = n.take_output();
-    REQUIRE(output.messages.size() == 1);
-    REQUIRE(std::get<append_entries_reply>(output.messages[0].msg).success == false);
-    REQUIRE(std::get<append_entries_reply>(output.messages[0].msg).term == 6);
+
+    REQUIRE(n.take_output().messages ==
+            std::vector{envelope{.from = 1, .to = 2, .msg = append_entries_reply{.term = 6, .success = false}}});
 }
 
 TEST_CASE("exactly one leader", "[election]") {
@@ -427,4 +445,219 @@ TEST_CASE("a reply delivered twice is still one vote", "[election]") {
     REQUIRE(n.current_role() == role::candidate);
     n.receive(envelope{.from = 3, .to = 1, .msg = request_vote_reply{.term = n.current_term(), .granted = true}});
     REQUIRE(n.current_role() == role::leader);
+}
+
+TEST_CASE("follower replicates leader's log", "[replication]") {
+    const auto leader_log = log_of({1, 2, 3});
+    memory_storage store;
+    node n{make_config(1, {1, 2, 3}, 42), &store};
+    n.receive(
+        envelope{.from = 2,
+                 .to = n.id(),
+                 .msg = append_entries{
+                     .term = 3, .prev_log_index = 0, .prev_log_term = 0, .entries = leader_log, .leader_commit = 3}});
+    REQUIRE(n.commit_index() == 3);
+    REQUIRE(std::ranges::equal(leader_log, n.log()));
+}
+
+TEST_CASE("follower commits only as far as it has verified", "[replication]") {
+    memory_storage store{persistent_state{.log = log_of({1, 1, 1, 2, 2, 2})}};
+    node n{make_config(1, {1, 2, 3}, 42), &store};
+    n.receive(
+        envelope{.from = 2,
+                 .to = n.id(),
+                 .msg = append_entries{
+                     .term = 3, .prev_log_index = 3, .prev_log_term = 1, .entries = {entry(2)}, .leader_commit = 6}});
+    const auto output = n.take_output();
+    REQUIRE(n.commit_index() == 4); // not 6: entries 5–6 were not verified against the leader
+    REQUIRE(output.messages ==
+            std::vector{envelope{
+                .from = 1,
+                .to = 2,
+                .msg = append_entries_reply{.term = 3, .success = true, .match_index = 4, .last_log_index = 6}}});
+}
+
+// Figure 7 of the Raft paper: the leader (term 8) has the log 1 1 1 4 4 5 5 6 6 6 8.
+// Followers (a)–(f) hold the logs below.
+
+TEST_CASE("follower accepts append_entries only if it has the entry at prev_log_index (Figure 7)", "[replication]") {
+    // The leader sends its newest entry (index 11, term 8), which follows index 10 with term 6.
+    struct row {
+        std::vector<log_entry> log;
+        append_entries_reply reply;
+        std::vector<log_entry> final_log;
+        const char* why;
+    };
+    const auto r = GENERATE(values<row>({
+        {.log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6}),
+         .reply = {.term = 8, .success = false, .last_log_index = 9},
+         .final_log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6}),
+         .why = "(a) log too short (9 < 10)"},
+        {.log = log_of({1, 1, 1, 4}),
+         .reply = {.term = 8, .success = false, .last_log_index = 4},
+         .final_log = log_of({1, 1, 1, 4}),
+         .why = "(b) log too short (4 < 10)"},
+        {.log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 6}),
+         .reply = {.term = 8, .success = true, .match_index = 11, .last_log_index = 11},
+         .final_log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 8}),
+         .why = "(c) index 10 matches; the term-6 entry at 11 conflicts with the term-8 entry"},
+        {.log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 7, 7}),
+         .reply = {.term = 8, .success = true, .match_index = 11, .last_log_index = 11},
+         .final_log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 8}),
+         .why = "(d) index 10 matches; 11–12 (term 7) are dropped"},
+        {.log = log_of({1, 1, 1, 4, 4, 4, 4}),
+         .reply = {.term = 8, .success = false, .last_log_index = 7},
+         .final_log = log_of({1, 1, 1, 4, 4, 4, 4}),
+         .why = "(e) log too short (7 < 10)"},
+        {.log = log_of({1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}),
+         .reply = {.term = 8, .success = false, .last_log_index = 11},
+         .final_log = log_of({1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}),
+         .why = "(f) term mismatch: there's an entry at 10, but its term is 3"},
+    }));
+    INFO(r.why);
+
+    memory_storage store{persistent_state{.log = r.log}};
+    node n{make_config(1, {1, 2, 3}, 42), &store};
+    n.receive(envelope{.from = 2,
+                       .to = n.id(),
+                       .msg = append_entries{
+                           .term = 8,
+                           .prev_log_index = 10,
+                           .prev_log_term = 6,
+                           .entries = {entry(8)},
+                           .leader_commit = 0,
+                       }});
+
+    REQUIRE(n.take_output().messages == std::vector{envelope{.from = 1, .to = 2, .msg = r.reply}});
+    REQUIRE(std::ranges::equal(r.final_log, n.log()));
+}
+
+TEST_CASE("follower ends up with the leader's log once prev_log_index matches (Figure 7)", "[replication]") {
+    // The leader has backed up to an entry the follower has, and sends everything after it.
+    struct row {
+        std::vector<log_entry> log;
+        append_entries request;
+        append_entries_reply reply;
+        const char* why;
+    };
+    const auto r = GENERATE(values<row>({
+        {.log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6}),
+         .request = {.term = 8, .prev_log_index = 9, .prev_log_term = 6, .entries = log_of({6, 8})},
+         .reply = {.term = 8, .success = true, .match_index = 11, .last_log_index = 11},
+         .why = "(a) appends 10–11"},
+        {.log = log_of({1, 1, 1, 4}),
+         .request = {.term = 8, .prev_log_index = 4, .prev_log_term = 4, .entries = log_of({4, 5, 5, 6, 6, 6, 8})},
+         .reply = {.term = 8, .success = true, .match_index = 11, .last_log_index = 11},
+         .why = "(b) appends 5–11"},
+        {.log = log_of({1, 1, 1, 4, 4, 4, 4}),
+         .request = {.term = 8, .prev_log_index = 5, .prev_log_term = 4, .entries = log_of({5, 5, 6, 6, 6, 8})},
+         .reply = {.term = 8, .success = true, .match_index = 11, .last_log_index = 11},
+         .why = "(e) truncates 6–7 (the term-4 entries), then appends 6–11"},
+        {.log = log_of({1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3}),
+         .request = {.term = 8, .prev_log_index = 3, .prev_log_term = 1, .entries = log_of({4, 4, 5, 5, 6, 6, 6, 8})},
+         .reply = {.term = 8, .success = true, .match_index = 11, .last_log_index = 11},
+         .why = "(f) truncates 4–11 (all of terms 2 and 3), then appends 4–11"},
+    }));
+    INFO(r.why);
+
+    memory_storage store{persistent_state{.log = r.log}};
+    node n{make_config(1, {1, 2, 3}, 42), &store};
+    n.receive(envelope{.from = 2, .to = n.id(), .msg = r.request});
+
+    REQUIRE(n.take_output().messages == std::vector{envelope{.from = 1, .to = 2, .msg = r.reply}});
+    REQUIRE(std::ranges::equal(log_of({1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 8}), n.log()));
+}
+
+TEST_CASE("a late, older append_entries does not truncate matching entries", "[replication]") {
+    // M2 (entries 10–11) arrived first; now the older M1 (entry 10 only) arrives.
+    memory_storage store{persistent_state{.log = log_of({1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 8})}};
+    node n{make_config(1, {1, 2, 3}), &store};
+    n.receive(
+        envelope{.from = 2,
+                 .to = 1,
+                 .msg = append_entries{.term = 8, .prev_log_index = 9, .prev_log_term = 6, .entries = log_of({6})}});
+
+    REQUIRE(n.take_output().messages ==
+            std::vector{envelope{
+                .from = 1,
+                .to = 2,
+                .msg = append_entries_reply{.term = 8, .success = true, .match_index = 10, .last_log_index = 11}}});
+    REQUIRE(store.load().log == log_of({1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 8})); // entry 11 survived, also on "disk"
+}
+
+TEST_CASE("propose on a non-leader returns not_leader and changes nothing", "[replication]") {
+    memory_storage store;
+    node n{make_config(1, {1, 2, 3}), &store};
+
+    SECTION("follower that knows the leader") {
+        n.receive(envelope{.from = 2, .to = 1, .msg = append_entries{.term = 1}});
+        (void)n.take_output();
+        const auto r = n.propose({std::byte{42}});
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().leader_hint == 2);
+    }
+    SECTION("candidate") {
+        REQUIRE(ticks_until_election(n) != -1);
+        (void)n.take_output();
+        const auto r = n.propose({std::byte{42}});
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().leader_hint == std::nullopt);
+    }
+
+    REQUIRE(n.log().empty());
+    REQUIRE(store.load().log.empty());
+    REQUIRE(n.take_output().messages.empty());
+}
+
+TEST_CASE("leader appends a proposed command, persists it and sends it to every peer", "[replication]") {
+    memory_storage store;
+    node n{make_config(1, {1, 2, 3}), &store};
+    elect(n);
+
+    const std::vector command{std::byte{42}};
+    const auto r = n.propose(command);
+
+    const auto e = log_entry{.term = 1, .kind = entry_kind::command, .data = command};
+    REQUIRE(r == 1); // the index the client waits on (phase 6)
+    REQUIRE(std::ranges::equal(n.log(), std::vector{e}));
+    REQUIRE(store.load().log == std::vector{e}); // on "disk" before anything left the node
+
+    const auto ae =
+        append_entries{.term = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = {e}, .leader_commit = 0};
+    REQUIRE(n.take_output().messages ==
+            std::vector{envelope{.from = 1, .to = 2, .msg = ae}, envelope{.from = 1, .to = 3, .msg = ae}});
+}
+
+TEST_CASE("a heartbeat resends entries the peers have not confirmed", "[replication]") {
+    memory_storage store;
+    node n{make_config(1, {1, 2, 3}), &store};
+    elect(n);
+
+    const std::vector command{std::byte{42}};
+    REQUIRE(n.propose(command) == 1);
+    (void)n.take_output(); // the network lost both append_entries
+
+    for (int i = 0; i < config{}.heartbeat_interval_ticks; ++i) {
+        n.tick();
+    }
+
+    const auto e = log_entry{.term = 1, .kind = entry_kind::command, .data = command};
+    const auto ae =
+        append_entries{.term = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = {e}, .leader_commit = 0};
+    REQUIRE(n.take_output().messages ==
+            std::vector{envelope{.from = 1, .to = 2, .msg = ae}, envelope{.from = 1, .to = 3, .msg = ae}});
+}
+
+TEST_CASE("a vote from an older term does not count", "[election]") {
+    memory_storage store;
+    node n{make_config(1, {1, 2, 3}), &store};
+    for (int i = 0; i < 2 * max_timeout && n.current_term() < 2; ++i) {
+        n.tick(); // the first election times out, the second starts in term 2
+    }
+    REQUIRE(n.current_term() == 2);
+    REQUIRE(n.current_role() == role::candidate);
+
+    n.receive(envelope{.from = 2, .to = 1, .msg = request_vote_reply{.term = 1, .granted = true}});
+
+    REQUIRE(n.current_role() == role::candidate);
 }

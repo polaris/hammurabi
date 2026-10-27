@@ -81,7 +81,7 @@ public:
 
     void tick();
     void receive(const envelope& env);
-    [[nodiscard]] std::expected<log_index, not_leader> propose(std::vector<std::byte> command); // step 4.1
+    [[nodiscard]] std::expected<log_index, not_leader> propose(std::vector<std::byte> command);
     [[nodiscard]] output take_output();
 
     [[nodiscard]] role current_role() const;
@@ -108,16 +108,27 @@ private:
     void handle(node_id from, const append_entries& m);
     void handle(node_id from, const append_entries_reply& m);
 
-    void become_follower(term_t term, std::optional<node_id> leader);
+    // A message from an older term never reaches handle(): reply "no" to requests, drop replies.
+    void reject_stale(node_id from, const request_vote& m);
+    void reject_stale(node_id from, const request_vote_reply& m);
+    void reject_stale(node_id from, const append_entries& m);
+    void reject_stale(node_id from, const append_entries_reply& m);
+
+    void adopt_term(term_t term); // higher term seen: new term, no vote, follower (persisted)
+    void become_follower(std::optional<node_id> leader);
     void become_candidate();
     void become_leader_if_won();
     void become_leader();
     void reset_election_timer();        // picks a new random timeout
     void send(node_id to, message msg); // appends to out_.messages
-    void broadcast_heartbeat();
+    void send_append_entries(node_id peer);
+    void broadcast_append_entries();
     [[nodiscard]] std::size_t majority() const { return cfg_.members.size() / 2 + 1; }
     [[nodiscard]] log_index last_log_index() const { return log_.size(); }
     [[nodiscard]] term_t term_at(log_index index) const; // 0 for index 0
+    void truncate_log_from(log_index index);
+    void append_to_log(std::span<const log_entry> entries); // persisted, then added to log_
+    void advance_commit_index(log_index index);
 
     config cfg_;
     storage* storage_;
@@ -125,7 +136,6 @@ private:
     hard_state hard_;            // persistent
     std::vector<log_entry> log_; // persistent; entry with index i lives at log_[i - 1]
     log_index commit_index_ = 0; // volatile
-    log_index handed_out_ = 0;   // volatile; "lastApplied" from the paper (see step 4.3)
     std::variant<follower_state, candidate_state, leader_state> role_;
     int election_elapsed_ = 0;
     int election_timeout_ = 0;

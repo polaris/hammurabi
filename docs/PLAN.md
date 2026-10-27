@@ -1031,13 +1031,15 @@ private:
     struct candidate_state { std::set<node_id> votes; };
     struct leader_state    { std::map<node_id, log_index> next_index; std::map<node_id, log_index> match_index; };
 
-    void become_follower(term_t term, std::optional<node_id> leader);
+    void reject_stale(node_id from, const request_vote& m);  // one overload per message type, like handle()
+    void adopt_term(term_t term);        // higher term seen: new term, no vote, follower (persisted)
+    void become_follower(std::optional<node_id> leader);
     void become_candidate();
     void become_leader_if_won();         // become_leader() once the votes are a majority
     void become_leader();
     void reset_election_timer();         // picks a new random timeout
     void send(node_id to, message msg);  // appends to out_.messages
-    void broadcast_heartbeat();          // step 2.3
+    void broadcast_append_entries();     // step 2.3
     [[nodiscard]] std::size_t majority() const { return cfg_.members.size() / 2 + 1; }
     [[nodiscard]] log_index last_log_index() const { return log_.size(); }
     [[nodiscard]] term_t term_at(log_index index) const;  // 0 for index 0
@@ -1105,17 +1107,27 @@ void node::tick() {
 
 **Goal:** A node grants or refuses votes exactly as Figure 2 and §5.4.1 say.
 
-**Build:** First the rule that applies to **every** message, in one central place:
+**Build:** First the term rules that apply to **every** message, in one central place. After them, a handler
+only ever sees messages from the current term:
 
 ```cpp
 void node::receive(const envelope& env) {
-    const term_t msg_term = std::visit([](const auto& m) { return m.term; }, env.msg);
-    if (msg_term > hard_.term) {
-        become_follower(msg_term, std::nullopt);  // Figure 2, "Rules for All Servers"
-    }
-    std::visit([&](const auto& m) { handle(env.from, m); }, env.msg);
+    std::visit([&](const auto& m) {
+        if (m.term > hard_.term) {
+            adopt_term(m.term);         // Figure 2, "Rules for All Servers"
+        }
+        if (m.term < hard_.term) {
+            reject_stale(env.from, m);  // Figure 2: "Reply false if term < currentTerm"
+            return;
+        }
+        handle(env.from, m);            // from here on: m.term == hard_.term
+    }, env.msg);
 }
 ```
+
+`reject_stale` has one overload per message type, next to `handle`: requests get a "no" with our term (so the
+sender learns it is behind), replies from an old term are dropped. `adopt_term` sets the new term, forgets
+the vote, persists both and becomes a follower without a known leader.
 
 Then the vote handler in full, because every line matters:
 
@@ -1126,7 +1138,7 @@ void node::handle(node_id from, const request_vote& m) {
     const bool log_ok = std::pair{m.last_log_term, m.last_log_index} >=
                         std::pair{term_at(last_log_index()), last_log_index()};
     const bool can_vote = !hard_.voted_for || *hard_.voted_for == from;  // "== from": a duplicate request
-    const bool grant = m.term == hard_.term && can_vote && log_ok;
+    const bool grant = can_vote && log_ok;
     if (grant) {
         hard_.voted_for = from;
         storage_->save_hard_state(hard_);  // persist BEFORE the reply leaves (section 5.7)
@@ -1137,8 +1149,9 @@ void node::handle(node_id from, const request_vote& m) {
 ```
 
 **Why this way:**
-- Requests with an older term are refused automatically: after `receive` has handled newer terms,
-  `m.term == hard_.term` is false for older ones.
+- No handler compares terms. `receive` has adopted newer terms and answered older ones, so every handler
+  works with `m.term == hard_.term`. One invariant in one place instead of a check in every handler.
+- A new message type without a `reject_stale` overload does not compile, so it cannot forget the rule.
 - A leader or candidate already voted for itself in this term, so `can_vote` is false for others. No special
   cases per role are needed.
 - `*hard_.voted_for == from` lets a candidate whose reply was lost ask again. With UDP, this happens.
@@ -1165,15 +1178,15 @@ cases from the table, plus: already voted for another node, same node asks again
 leaders and candidates step down.
 
 **Build:**
-- `handle(request_vote_reply)`: if candidate and `m.term == hard_.term` and `m.granted`, insert `from` into
+- `handle(request_vote_reply)`: if candidate and `m.granted`, insert `from` into
   `votes` and call `become_leader_if_won()`.
 - `become_leader()`: set up `leader_state` (next index = last index + 1, match index = 0 for every peer) and
-  send heartbeats immediately (`broadcast_heartbeat()`).
+  send heartbeats immediately (`broadcast_append_entries()`).
 - Heartbeat: `append_entries` with no entries. `prev_log_index`/`prev_log_term` are taken from `next_index`.
 - `handle(append_entries)` (simple version; phase 4 adds the log part):
-  - If `m.term < hard_.term`, reply `success = false`.
-  - Otherwise call `become_follower(m.term, from)` (a candidate in the same term steps down; everyone
-    resets the election timer) and reply `success = true`.
+  - Older terms never get here (`reject_stale` replies `success = false`).
+  - Call `become_follower(from)` (a candidate in the same term steps down; everyone resets the election
+    timer) and reply `success = true`.
 - `handle(append_entries_reply)`: ignore for now (phase 4).
 - A small test helper `deliver_all(nodes)` that moves messages from each node's output to the receivers
   until nothing is left.
@@ -1316,12 +1329,9 @@ up to that point.
 
 ```cpp
 void node::handle(node_id from, const append_entries& m) {
-    if (m.term < hard_.term) {
-        send(from, append_entries_reply{.term = hard_.term, .success = false, .match_index = 0,
-                                        .last_log_index = last_log_index()});
-        return;
-    }
-    become_follower(m.term, from);  // same term: only resets the timer and remembers the leader
+    // receive() has handled other terms: m.term == hard_.term (older ones went to reject_stale).
+    assert(!std::holds_alternative<leader_state>(role_));  // Election Safety: two leaders in one term
+    become_follower(from);  // resets the timer and remembers the leader
 
     // 1. Consistency check: do we have the entry the new entries follow?
     if (m.prev_log_index > last_log_index() || term_at(m.prev_log_index) != m.prev_log_term) {
@@ -1382,8 +1392,8 @@ apply entries that may be wrong. Using `min(6, 4) = 4` is correct.
 ```cpp
 void node::handle(node_id from, const append_entries_reply& m) {
     auto* leader = std::get_if<leader_state>(&role_);
-    if (leader == nullptr || m.term != hard_.term) {
-        return;  // stale reply from another term, or we are no longer leader
+    if (leader == nullptr) {
+        return;  // we are no longer leader (replies from other terms never get here, see receive())
     }
     if (m.success) {
         leader->match_index[from] = std::max(leader->match_index[from], m.match_index);
@@ -2204,14 +2214,14 @@ it. Apple Clang does not ship libFuzzer, so this runs on Linux only.
 | Candidate: increment term, vote for self, reset timer, send RequestVote | 2.1 | `become_candidate` |
 | Candidate: majority of votes → leader | 2.3 | `handle(request_vote_reply)` |
 | Candidate: AppendEntries from new leader → follower | 2.3 | `handle(append_entries)` |
-| RequestVote: reply false if term < currentTerm | 2.2 | `handle(request_vote)` |
+| RequestVote: reply false if term < currentTerm | 2.2 | `node::receive` → `reject_stale` |
 | RequestVote: grant if votedFor is null/candidate and log up to date (§5.4.1) | 2.2 | `handle(request_vote)` |
 | Persist currentTerm, votedFor, log before responding | 2.1, 2.2, 4.1, 6.3–6.4 | `storage` calls |
 | Leader: heartbeats to prevent elections | 2.3 | `tick`, `send_append_entries` |
 | Leader: append client command, respond after applied | 4.1, 5.1 | `propose`, `replica` |
 | Leader: send entries from nextIndex; on failure decrement nextIndex | 4.1, 4.2 | `send_append_entries`, `handle(append_entries_reply)` |
 | Leader: commit N if majority matchIndex ≥ N and log[N].term == currentTerm (§5.4.2) | 4.3 | `maybe_advance_commit` |
-| AppendEntries: reply false if term < currentTerm | 4.1 | `handle(append_entries)` |
+| AppendEntries: reply false if term < currentTerm | 2.3 | `node::receive` → `reject_stale` |
 | AppendEntries: reply false if log lacks prevLogIndex/prevLogTerm | 4.1 | `handle(append_entries)` |
 | AppendEntries: delete conflicting entries and all after | 4.1 | `handle(append_entries)` |
 | AppendEntries: append new entries | 4.1 | `handle(append_entries)` |
