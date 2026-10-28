@@ -166,7 +166,25 @@ void node::advance_commit_index(log_index index) {
     }
 }
 
-void node::handle(node_id /*from*/, const append_entries_reply& /*m*/) {} // step 4.2
+void node::handle(node_id from, const append_entries_reply& m) {
+    auto* leader = std::get_if<leader_state>(&role_);
+    if (leader == nullptr) {
+        return; // we are no longer leader (replies from other terms never get here, see receive())
+    }
+    if (m.success) {
+        leader->match_index[from] = std::max(leader->match_index[from], m.match_index);
+        leader->next_index[from] = std::max(leader->next_index[from], m.match_index + 1);
+        maybe_advance_commit(); // step 4.3
+    } else {
+        // Go back, but jump straight to the follower's end if its log is short,
+        // and never below what we already know matches.
+        auto& next = leader->next_index[from];
+        next = std::max(leader->match_index[from] + 1, std::min(next - 1, m.last_log_index + 1));
+        send_append_entries(from);
+    }
+}
+
+void node::maybe_advance_commit() {}
 
 std::expected<log_index, not_leader> node::propose(std::vector<std::byte> command) {
     if (current_role() != role::leader) {

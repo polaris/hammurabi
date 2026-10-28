@@ -661,3 +661,104 @@ TEST_CASE("a vote from an older term does not count", "[election]") {
 
     REQUIRE(n.current_role() == role::candidate);
 }
+
+TEST_CASE("a leader brings lagging and conflicting followers up to date in one heartbeat round", "[replication]") {
+    const auto log = log_of({1, 1, 2, 2, 5, 5, 5});
+    memory_storage store1{persistent_state{
+        .hard = hard_state{.term = 6},
+        .log = log,
+    }};
+    memory_storage store2{persistent_state{
+        .hard = hard_state{.term = 3},
+        .log = log_of({1, 1, 2, 2, 3}),
+    }};
+    memory_storage store3{persistent_state{
+        .hard = hard_state{.term = 4},
+        .log = log_of({1, 1, 2, 2, 3, 4}),
+    }};
+    std::vector<node> nodes = {
+        node{make_config(1, {1, 2, 3}, 42), &store1},
+        node{make_config(2, {1, 2, 3}, 67), &store2},
+        node{make_config(3, {1, 2, 3}, 12), &store3},
+    };
+
+    elect(nodes[0]);
+
+    for (int i = 1; i <= config{}.heartbeat_interval_ticks; ++i) {
+        for (auto& n : nodes) {
+            n.tick();
+        }
+        deliver_all(nodes);
+    }
+
+    REQUIRE(nodes[0].current_role() == role::leader);
+
+    REQUIRE(std::ranges::equal(nodes[0].log(), log));
+    REQUIRE(std::ranges::equal(nodes[1].log(), log));
+    REQUIRE(std::ranges::equal(nodes[2].log(), log));
+    REQUIRE(store1.load().log == log);
+    REQUIRE(store2.load().log == log);
+    REQUIRE(store3.load().log == log);
+}
+
+TEST_CASE("after a rejection, the leader jumps back to just past the follower's last entry", "[replication]") {
+    memory_storage store{persistent_state{.hard = {.term = 3}, .log = log_of({1, 2, 2, 3, 3, 3, 3})}};
+    node n{make_config(1, {1, 2, 3}), &store};
+    elect(n);
+
+    n.receive(envelope{.from = 2,
+                       .to = 1,
+                       .msg = append_entries_reply{
+                           .term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 2}});
+
+    const auto output = n.take_output();
+    REQUIRE(output.messages == std::vector{envelope{.from = 1,
+                                                    .to = 2,
+                                                    .msg = append_entries{.term = n.current_term(),
+                                                                          .prev_log_index = 2,
+                                                                          .prev_log_term = 2,
+                                                                          .entries = log_of({2, 3, 3, 3, 3}),
+                                                                          .leader_commit = 0}}});
+}
+
+TEST_CASE("duplicated and reordered replies leave next_index/match_index correct", "[replication]") {
+    memory_storage store{persistent_state{.hard = {.term = 3}, .log = log_of({1, 2, 2, 3, 3, 3, 3})}};
+    node n{make_config(1, {1, 2, 3}), &store};
+    elect(n);
+
+    // Node 2 confirms the whole log. The replies below answer older probes and arrive late.
+    n.receive(envelope{
+        .from = 2,
+        .to = 1,
+        .msg = append_entries_reply{.term = n.current_term(), .success = true, .match_index = 7, .last_log_index = 7}});
+    (void)n.take_output();
+
+    // An empty probe right after the last entry: nothing to resend.
+    const auto probe = append_entries{
+        .term = n.current_term(), .prev_log_index = 7, .prev_log_term = 3, .entries = {}, .leader_commit = 0};
+
+    SECTION("an older success does not move match_index or next_index back") {
+        n.receive(envelope{.from = 2,
+                           .to = 1,
+                           .msg = append_entries_reply{
+                               .term = n.current_term(), .success = true, .match_index = 3, .last_log_index = 3}});
+        (void)n.take_output();
+
+        for (int i = 0; i < config{}.heartbeat_interval_ticks; ++i) {
+            n.tick();
+        }
+
+        // Node 3 never replied, so its next_index is still the initial last_log_index() + 1.
+        REQUIRE(n.take_output().messages ==
+                std::vector{envelope{.from = 1, .to = 2, .msg = probe}, envelope{.from = 1, .to = 3, .msg = probe}});
+    }
+
+    SECTION("a stale rejection does not move next_index below match_index + 1") {
+        n.receive(envelope{.from = 2,
+                           .to = 1,
+                           .msg = append_entries_reply{
+                               .term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 2}});
+
+        REQUIRE(n.take_output().messages == std::vector{envelope{.from = 1, .to = 2, .msg = probe}});
+    }
+}

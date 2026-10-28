@@ -129,6 +129,7 @@ private:
     void truncate_log_from(log_index index);
     void append_to_log(std::span<const log_entry> entries); // persisted, then added to log_
     void advance_commit_index(log_index index);
+    void maybe_advance_commit();
 
     config cfg_;
     storage* storage_;
