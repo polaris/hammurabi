@@ -1,5 +1,6 @@
 #include "raft_string_makers.h" // IWYU pragma: keep
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <hammurabi/raft/messages.h>
@@ -10,8 +11,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -41,6 +44,13 @@ log_entry entry(term_t term) {
     return log_entry{.term = term};
 }
 
+log_entry noop_entry(term_t term) {
+    return log_entry{.term = term, .kind = entry_kind::noop};
+}
+
+using committed_entries = std::vector<std::pair<log_index, log_entry>>;
+using committed_by_node = std::map<node_id, committed_entries>;
+
 std::vector<log_entry> log_of(const std::vector<term_t>& terms) {
     std::vector<log_entry> entries;
     entries.reserve(terms.size());
@@ -60,12 +70,18 @@ request_vote_reply ask_for_vote(node& n, const envelope& request) {
     return std::get<request_vote_reply>(output.messages[0].msg);
 }
 
-void deliver_all(std::vector<node>& nodes) {
+// Delivers messages until none are left. Entries the nodes hand out on the way are
+// appended to *committed, or dropped if it is null.
+void deliver_all(std::vector<node>& nodes, committed_by_node* committed = nullptr) {
     while (true) {
         std::vector<envelope> in_flight;
         for (auto& n : nodes) {
             auto output = n.take_output();
             in_flight.insert(in_flight.end(), output.messages.begin(), output.messages.end());
+            if (committed != nullptr) {
+                auto& entries = (*committed)[n.id()];
+                entries.insert(entries.end(), output.committed.begin(), output.committed.end());
+            }
         }
         for (const auto& env : in_flight) {
             assert(env.to >= 1 && env.to <= nodes.size()); // node ids are 1..N in vector order
@@ -74,6 +90,16 @@ void deliver_all(std::vector<node>& nodes) {
         if (in_flight.empty()) {
             return;
         }
+    }
+}
+
+// Ticks long enough for the leader to send exactly one heartbeat, delivering after every tick.
+void heartbeat_round(std::vector<node>& nodes, committed_by_node* committed = nullptr) {
+    for (int i = 0; i < config{}.heartbeat_interval_ticks; ++i) {
+        for (auto& n : nodes) {
+            n.tick();
+        }
+        deliver_all(nodes, committed);
     }
 }
 
@@ -87,12 +113,13 @@ struct stable_leader {
 // everyone else is a follower. Fails the test if that doesn't happen within
 // the limit. (Not an optional + REQUIRE at the call site: clang-tidy can't see
 // that a failed REQUIRE ends the test, so it flags every access after it.)
-stable_leader ticks_until_stable_leader(std::vector<node>& nodes, int limit = 100) {
+stable_leader ticks_until_stable_leader(std::vector<node>& nodes, committed_by_node* committed = nullptr,
+                                        int limit = 100) {
     for (int i = 1; i <= limit; ++i) {
         for (auto& n : nodes) {
             n.tick();
         }
-        deliver_all(nodes);
+        deliver_all(nodes, committed);
         bool leader_elected = false;
         std::vector<std::size_t> followers;
         std::size_t leader = 0;
@@ -354,7 +381,8 @@ TEST_CASE("leader refuses append_entries from an older term", "[election]") {
     n.receive(envelope{.from = 2, .to = 1, .msg = append_entries{.term = 5}});
 
     REQUIRE(n.take_output().messages ==
-            std::vector{envelope{.from = 1, .to = 2, .msg = append_entries_reply{.term = 6, .success = false}}});
+            std::vector{envelope{
+                .from = 1, .to = 2, .msg = append_entries_reply{.term = 6, .success = false, .last_log_index = 1}}});
 }
 
 TEST_CASE("exactly one leader", "[election]") {
@@ -615,15 +643,14 @@ TEST_CASE("leader appends a proposed command, persists it and sends it to every 
     elect(n);
 
     const std::vector command{std::byte{42}};
-    const auto r = n.propose(command);
+    REQUIRE(n.propose(command) == 2); // the index the client waits on (phase 6)
 
-    const auto e = log_entry{.term = 1, .kind = entry_kind::command, .data = command};
-    REQUIRE(r == 1); // the index the client waits on (phase 6)
-    REQUIRE(std::ranges::equal(n.log(), std::vector{e}));
-    REQUIRE(store.load().log == std::vector{e}); // on "disk" before anything left the node
+    const std::vector expected{noop_entry(1), log_entry{.term = 1, .kind = entry_kind::command, .data = command}};
+    REQUIRE(std::ranges::equal(n.log(), expected));
+    REQUIRE(store.load().log == expected); // on "disk" before anything left the node
 
     const auto ae =
-        append_entries{.term = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = {e}, .leader_commit = 0};
+        append_entries{.term = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = expected, .leader_commit = 0};
     REQUIRE(n.take_output().messages ==
             std::vector{envelope{.from = 1, .to = 2, .msg = ae}, envelope{.from = 1, .to = 3, .msg = ae}});
 }
@@ -634,16 +661,17 @@ TEST_CASE("a heartbeat resends entries the peers have not confirmed", "[replicat
     elect(n);
 
     const std::vector command{std::byte{42}};
-    REQUIRE(n.propose(command) == 1);
+    REQUIRE(n.propose(command) == 2);
     (void)n.take_output(); // the network lost both append_entries
 
     for (int i = 0; i < config{}.heartbeat_interval_ticks; ++i) {
         n.tick();
     }
 
-    const auto e = log_entry{.term = 1, .kind = entry_kind::command, .data = command};
+    const auto e1 = noop_entry(1);
+    const auto e2 = log_entry{.term = 1, .kind = entry_kind::command, .data = command};
     const auto ae =
-        append_entries{.term = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = {e}, .leader_commit = 0};
+        append_entries{.term = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = {e1, e2}, .leader_commit = 0};
     REQUIRE(n.take_output().messages ==
             std::vector{envelope{.from = 1, .to = 2, .msg = ae}, envelope{.from = 1, .to = 3, .msg = ae}});
 }
@@ -684,21 +712,19 @@ TEST_CASE("a leader brings lagging and conflicting followers up to date in one h
 
     elect(nodes[0]);
 
-    for (int i = 1; i <= config{}.heartbeat_interval_ticks; ++i) {
-        for (auto& n : nodes) {
-            n.tick();
-        }
-        deliver_all(nodes);
-    }
+    heartbeat_round(nodes);
+
+    auto expected = log;
+    expected.push_back(noop_entry(nodes[0].current_term()));
 
     REQUIRE(nodes[0].current_role() == role::leader);
 
-    REQUIRE(std::ranges::equal(nodes[0].log(), log));
-    REQUIRE(std::ranges::equal(nodes[1].log(), log));
-    REQUIRE(std::ranges::equal(nodes[2].log(), log));
-    REQUIRE(store1.load().log == log);
-    REQUIRE(store2.load().log == log);
-    REQUIRE(store3.load().log == log);
+    REQUIRE(std::ranges::equal(nodes[0].log(), expected));
+    REQUIRE(std::ranges::equal(nodes[1].log(), expected));
+    REQUIRE(std::ranges::equal(nodes[2].log(), expected));
+    REQUIRE(store1.load().log == expected);
+    REQUIRE(store2.load().log == expected);
+    REQUIRE(store3.load().log == expected);
 }
 
 TEST_CASE("after a rejection, the leader jumps back to just past the follower's last entry", "[replication]") {
@@ -711,13 +737,16 @@ TEST_CASE("after a rejection, the leader jumps back to just past the follower's 
                        .msg = append_entries_reply{
                            .term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 2}});
 
+    auto expected = log_of({2, 3, 3, 3, 3});
+    expected.push_back(noop_entry(n.current_term()));
+
     const auto output = n.take_output();
     REQUIRE(output.messages == std::vector{envelope{.from = 1,
                                                     .to = 2,
                                                     .msg = append_entries{.term = n.current_term(),
                                                                           .prev_log_index = 2,
                                                                           .prev_log_term = 2,
-                                                                          .entries = log_of({2, 3, 3, 3, 3}),
+                                                                          .entries = expected,
                                                                           .leader_commit = 0}}});
 }
 
@@ -726,16 +755,19 @@ TEST_CASE("duplicated and reordered replies leave next_index/match_index correct
     node n{make_config(1, {1, 2, 3}), &store};
     elect(n);
 
-    // Node 2 confirms the whole log. The replies below answer older probes and arrive late.
+    // Node 2 confirms everything before the no-op. The replies below answer older probes and arrive late.
     n.receive(envelope{
         .from = 2,
         .to = 1,
         .msg = append_entries_reply{.term = n.current_term(), .success = true, .match_index = 7, .last_log_index = 7}});
     (void)n.take_output();
 
-    // An empty probe right after the last entry: nothing to resend.
-    const auto probe = append_entries{
-        .term = n.current_term(), .prev_log_index = 7, .prev_log_term = 3, .entries = {}, .leader_commit = 0};
+    // The probe resends only the no-op.
+    const auto probe = append_entries{.term = n.current_term(),
+                                      .prev_log_index = 7,
+                                      .prev_log_term = 3,
+                                      .entries = {noop_entry(n.current_term())},
+                                      .leader_commit = 0};
 
     SECTION("an older success does not move match_index or next_index back") {
         n.receive(envelope{.from = 2,
@@ -760,5 +792,144 @@ TEST_CASE("duplicated and reordered replies leave next_index/match_index correct
                                .term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 2}});
 
         REQUIRE(n.take_output().messages == std::vector{envelope{.from = 1, .to = 2, .msg = probe}});
+    }
+}
+
+TEST_CASE("1-node cluster commits immediately", "[replication]") {
+    memory_storage store{};
+    node n{make_config(1, {1}), &store};
+
+    {
+        ticks_until_election(n);
+        REQUIRE(n.current_role() == role::leader);
+        REQUIRE(n.commit_index() == 1);
+        const auto output = n.take_output();
+        REQUIRE(output.messages.empty());
+        REQUIRE(output.committed == committed_entries{{1, noop_entry(n.current_term())}});
+    }
+
+    {
+        const std::vector command{std::byte{42}};
+        REQUIRE(n.propose(command) == 2); // the index the client waits on (phase 6)
+        const auto output = n.take_output();
+        REQUIRE(output.messages.empty());
+        REQUIRE(output.committed ==
+                committed_entries{{2, log_entry{.term = 1, .kind = entry_kind::command, .data = command}}});
+        REQUIRE(
+            std::ranges::equal(store.load().log, std::vector<log_entry>{
+                                                     noop_entry(n.current_term()),
+                                                     log_entry{.term = 1, .kind = entry_kind::command, .data = command},
+                                                 }));
+    }
+}
+
+// Figure 8: prepare the logs of situation 3 with memory_storage. Assert that index 2 does not become committed while
+// only term-2 entries are on the majority, and that it does once the term-4 no-op is.
+TEST_CASE("figure 8, situation 3", "[replication]") {
+    memory_storage store{persistent_state{.hard = hard_state{.term = 3}, .log = log_of({1, 2})}};
+    node S1{make_config(1, {1, 2, 3, 4, 5}), &store};
+
+    REQUIRE(ticks_until_election(S1) != -1);
+    S1.receive(envelope{.from = 2, .to = 1, .msg = request_vote_reply{.term = 4, .granted = true}});
+    S1.receive(envelope{.from = 3, .to = 1, .msg = request_vote_reply{.term = 4, .granted = true}});
+    REQUIRE(std::ranges::equal(store.load().log, std::vector<log_entry>{entry(1), entry(2), noop_entry(4)}));
+
+    S1.receive(
+        envelope{.from = 2,
+                 .to = 1,
+                 .msg = append_entries_reply{.term = 4, .success = true, .match_index = 2, .last_log_index = 2}});
+    S1.receive(
+        envelope{.from = 3,
+                 .to = 1,
+                 .msg = append_entries_reply{.term = 4, .success = true, .match_index = 2, .last_log_index = 2}});
+    REQUIRE(S1.take_output().committed.empty());
+    REQUIRE(S1.commit_index() == 0);
+
+    S1.receive(
+        envelope{.from = 2,
+                 .to = 1,
+                 .msg = append_entries_reply{.term = 4, .success = true, .match_index = 3, .last_log_index = 3}});
+    REQUIRE(S1.commit_index() == 0);
+    REQUIRE(S1.take_output().committed.empty());
+
+    S1.receive(
+        envelope{.from = 3,
+                 .to = 1,
+                 .msg = append_entries_reply{.term = 4, .success = true, .match_index = 3, .last_log_index = 3}});
+    REQUIRE(S1.commit_index() == 3);
+    REQUIRE(S1.take_output().committed == committed_entries{
+                                              {1, entry(1)},
+                                              {2, entry(2)},
+                                              {3, noop_entry(4)},
+                                          });
+}
+
+TEST_CASE("a proposal on a 3-node cluster is committed on all nodes and appears in committed exactly once",
+          "[replication]") {
+    memory_storage store1, store2, store3;
+    std::vector<node> nodes = {
+        node{make_config(1, {1, 2, 3}, 42), &store1},
+        node{make_config(2, {1, 2, 3}, 67), &store2},
+        node{make_config(3, {1, 2, 3}, 12), &store3},
+    };
+
+    committed_by_node committed;
+    const auto sl = ticks_until_stable_leader(nodes, &committed); // the leader commits its no-op in here
+
+    auto& leader = nodes[sl.leader];
+
+    REQUIRE(leader.propose({std::byte(42)}).has_value());
+    deliver_all(nodes, &committed);
+
+    REQUIRE(leader.propose({std::byte(43)}).has_value());
+    deliver_all(nodes, &committed);
+
+    // The leader has committed everything by now, but the followers only learn that from its next append.
+    heartbeat_round(nodes, &committed);
+
+    const std::vector<log_entry> expected{
+        noop_entry(leader.current_term()),
+        log_entry{.term = leader.current_term(), .kind = entry_kind::command, .data = {std::byte(42)}},
+        log_entry{.term = leader.current_term(), .kind = entry_kind::command, .data = {std::byte(43)}},
+    };
+    CHECK(store1.load().log == expected);
+    CHECK(store2.load().log == expected);
+    CHECK(store3.load().log == expected);
+
+    const committed_entries expected_committed{{1, expected[0]}, {2, expected[1]}, {3, expected[2]}};
+    for (const auto& n : nodes) {
+        CAPTURE(n.id());
+        CHECK(n.commit_index() == 3);
+        CHECK(committed[n.id()] == expected_committed);
+    }
+
+    // Nothing is handed out a second time.
+    heartbeat_round(nodes, &committed);
+    for (const auto& n : nodes) {
+        CAPTURE(n.id());
+        CHECK(committed[n.id()] == expected_committed);
+    }
+}
+
+TEST_CASE("unknown sender does not change commit index and nothing is sent", "[replication]") {
+    memory_storage store{persistent_state{.hard = hard_state{.term = 3}, .log = log_of({1, 2})}};
+    node n{make_config(1, {1, 2, 3}), &store};
+    elect(n); // log is now {1, 2, noop(4)}
+
+    SECTION("a success does not count as a replica") {
+        n.receive(envelope{.from = 9,
+                           .to = 1,
+                           .msg = append_entries_reply{
+                               .term = n.current_term(), .success = true, .match_index = 3, .last_log_index = 3}});
+        REQUIRE(n.commit_index() == 0);
+        REQUIRE(n.take_output().committed.empty());
+    }
+
+    SECTION("a rejection sends nothing back") {
+        n.receive(envelope{.from = 9,
+                           .to = 1,
+                           .msg = append_entries_reply{
+                               .term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 0}});
+        REQUIRE(n.take_output().messages.empty());
     }
 }

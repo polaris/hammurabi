@@ -4,6 +4,7 @@
 #include <catch2/catch_tostring.hpp>
 #include <hammurabi/raft/format.h>
 #include <hammurabi/raft/messages.h>
+#include <hammurabi/raft/types.h>
 
 #include <format>
 #include <string>
@@ -46,5 +47,9 @@ struct Catch::StringMaker<hammurabi::raft::message>
 template<>
 struct Catch::StringMaker<hammurabi::raft::envelope>
 : hammurabi::raft::testing::formatter_string_maker<hammurabi::raft::envelope> {};
+
+template<>
+struct Catch::StringMaker<hammurabi::raft::log_entry>
+: hammurabi::raft::testing::formatter_string_maker<hammurabi::raft::log_entry> {};
 
 #endif // HAMMURABI_TESTS_RAFT_STRING_MAKERS_H

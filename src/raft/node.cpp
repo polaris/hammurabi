@@ -7,7 +7,10 @@
 #include <cassert>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <optional>
+#include <ranges>
+#include <span>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -171,20 +174,33 @@ void node::handle(node_id from, const append_entries_reply& m) {
     if (leader == nullptr) {
         return; // we are no longer leader (replies from other terms never get here, see receive())
     }
+    const auto it = leader->match_index.find(from);
+    if (it == leader->match_index.end()) {
+        return;
+    }
     if (m.success) {
-        leader->match_index[from] = std::max(leader->match_index[from], m.match_index);
+        it->second = std::max(it->second, m.match_index);
         leader->next_index[from] = std::max(leader->next_index[from], m.match_index + 1);
         maybe_advance_commit(); // step 4.3
     } else {
         // Go back, but jump straight to the follower's end if its log is short,
         // and never below what we already know matches.
         auto& next = leader->next_index[from];
-        next = std::max(leader->match_index[from] + 1, std::min(next - 1, m.last_log_index + 1));
+        next = std::max(it->second + 1, std::min(next - 1, m.last_log_index + 1));
         send_append_entries(from);
     }
 }
 
-void node::maybe_advance_commit() {}
+void node::maybe_advance_commit() {
+    const auto& leader = std::get<leader_state>(role_);
+    auto matched = leader.match_index | std::views::values | std::ranges::to<std::vector>();
+    matched.push_back(last_log_index()); // the leader counts itself
+    std::ranges::sort(matched, std::greater{});
+    const log_index candidate = matched[majority() - 1]; // stored on at least a majority
+    if (candidate > commit_index_ && term_at(candidate) == hard_.term) {
+        commit_index_ = candidate; // §5.4.2: count only current-term entries
+    }
+}
 
 std::expected<log_index, not_leader> node::propose(std::vector<std::byte> command) {
     if (current_role() != role::leader) {
@@ -192,6 +208,7 @@ std::expected<log_index, not_leader> node::propose(std::vector<std::byte> comman
     }
     const log_entry e{.term = current_term(), .kind = entry_kind::command, .data = std::move(command)};
     append_to_log(std::span{&e, 1});
+    maybe_advance_commit();
     broadcast_append_entries();
     return last_log_index();
 }
@@ -221,6 +238,12 @@ void node::broadcast_append_entries() {
 }
 
 output node::take_output() {
+    assert(handed_out_ <= commit_index_ && commit_index_ <= last_log_index());
+    const auto fresh = std::span(log_).subspan(handed_out_, commit_index_ - handed_out_);
+    for (auto [i, entry] : std::views::zip(std::views::iota(handed_out_ + 1), fresh)) {
+        out_.committed.emplace_back(i, entry);
+    }
+    handed_out_ = commit_index_;
     return std::exchange(out_, {});
 }
 
@@ -299,6 +322,9 @@ void node::become_leader() {
     }
     role_ = std::move(ls);
     heartbeat_elapsed_ = 0;
+    const log_entry e{.term = current_term(), .kind = entry_kind::noop};
+    append_to_log(std::span{&e, 1});
+    maybe_advance_commit();
     broadcast_append_entries();
 }
 

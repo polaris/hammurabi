@@ -137,6 +137,7 @@ private:
     hard_state hard_;            // persistent
     std::vector<log_entry> log_; // persistent; entry with index i lives at log_[i - 1]
     log_index commit_index_ = 0; // volatile
+    log_index handed_out_ = 0;   // volatile; "lastApplied" from the paper (see step 4.3)
     std::variant<follower_state, candidate_state, leader_state> role_;
     int election_elapsed_ = 0;
     int election_timeout_ = 0;

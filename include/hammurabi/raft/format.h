@@ -2,6 +2,7 @@
 #define HAMMURABI_RAFT_FORMAT_H
 
 #include <hammurabi/raft/messages.h>
+#include <hammurabi/raft/types.h>
 
 #include <format>
 #include <variant>
@@ -56,6 +57,14 @@ template<>
 struct std::formatter<hammurabi::raft::envelope> : hammurabi::raft::detail::no_spec_formatter {
     auto format(const hammurabi::raft::envelope& env, std::format_context& ctx) const {
         return std::format_to(ctx.out(), "{}→{} {}", env.from, env.to, env.msg);
+    }
+};
+
+template<>
+struct std::formatter<hammurabi::raft::log_entry> : hammurabi::raft::detail::no_spec_formatter {
+    auto format(const hammurabi::raft::log_entry& e, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "term={} kind={} size={}", e.term,
+                              e.kind == hammurabi::raft::entry_kind::noop ? "noop" : "command", e.data.size());
     }
 };
 
