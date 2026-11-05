@@ -51,8 +51,8 @@ project that builds and tests that pass.
   example and you write the rest. Harder ideas are explained with concrete examples.
 - From step 0.2 on, every step ends with `scripts/check.sh` passing (see [6.5](#65-the-standard-check)).
   Steps may name extra checks.
-- Commit after every step. Use the same message style as the existing history: `feat:`, `fix:`, `test:`,
-  `chore:`, `docs:`.
+- Commit after every step, with the message `Step X.Y: <title of the step>`. Commits between steps use a prefix:
+  `feat:`, `fix:`, `refactor:`, `style:`, `test:`, `chore:`, `docs:`.
 
 ---
 
@@ -197,8 +197,8 @@ The only side effect the node performs itself is writing its persistent state th
 
 ```cpp
 raft::memory_storage storage;
-raft::node node{config_for_three_nodes(/*self=*/1), storage};
-tick_until_election(node);                                    // the test decides when time passes
+raft::node node{config_for_three_nodes(/*self=*/1), &storage};
+REQUIRE(ticks_until_election(node) != -1);                    // the test decides when time passes
 auto out = node.take_output();
 REQUIRE(out.messages.size() == 2);                            // one RequestVote to each peer
 CHECK(std::holds_alternative<raft::request_vote>(out.messages[0].msg));
@@ -255,6 +255,7 @@ Directory layout:
 
 ```
 include/hammurabi/{wire,raft,kv,replica,storage,net}/*.h   public headers
+include/hammurabi/attributes.h                             HAMMURABI_LIFETIMEBOUND, shared by the libraries
 src/{wire,raft,kv,replica,storage,net}/*.cpp               implementation
 apps/server/main.cpp, apps/cli/main.cpp
 tests/unit/, tests/sim/, tests/integration/, fuzz/
@@ -488,7 +489,7 @@ drift and are out of scope.
 
 | Situation | Mechanism | Example |
 |---|---|---|
-| Expected failure the caller must handle | `std::expected<T, E>` | Decoding bytes from the network; `propose` on a follower; parsing `--node` options |
+| Expected failure the caller must handle | `std::expected<T, E>` | Decoding bytes from the network; `propose` on a follower or with an oversized command; parsing `--node` options |
 | Value that may be absent | `std::optional<T>` | `voted_for`, the leader hint |
 | Unrecoverable error | Exception, caught in `main`, which prints the error and exits | Disk I/O failure; cannot bind a port |
 | Programming error (a broken invariant) | `assert` (active in Debug builds, which tests use) | Two leaders in the same term inside one node |
@@ -507,11 +508,14 @@ These rules make the simulation reproducible with the same seed on every platfor
 
 - Names are `snake_case` like the standard library. Member variables end in `_`.
 - Prefer the rule of zero: no hand-written destructors or copy/move operations unless a class owns a raw
-  resource (only the file descriptor wrapper in step 6.3 does).
+  resource (only the file descriptor wrapper in step 6.3 does). Two classes declare them for other reasons:
+  the abstract `storage` needs a virtual destructor and defaults the rest, and `sim::cluster` deletes them
+  because its nodes point into its storages.
 - Use `[[nodiscard]]` where ignoring a result is a bug (`propose`, `decode_*`, `take_output`).
 - Build message structs with **designated initializers**: `request_vote{.term = 3, .last_log_index = 7, ...}`.
   The call site then shows which number is which. This matters a lot when a struct has three
-  `std::uint64_t` fields in a row.
+  `std::uint64_t` fields in a row. Give `std::vector` and `std::optional` members of such structs a `{}`
+  initializer; otherwise GCC's `-Wmissing-field-initializers` warns when a call site leaves them out.
 - Formatting is decided by clang-format; CI rejects unformatted code.
 
 ---
@@ -551,7 +555,9 @@ Protobuf is removed. When adding CLI11, take the current version from ConanCente
 | `std::byteswap` | `wire::writer/reader` | Convert integers between the machine's byte order and big-endian in one standard call, with no hand-written shifting. |
 | `std::to_underlying` | Message type tags | Turn an `enum class` value into its integer for encoding, without a `static_cast` that silently breaks if the enum's type changes. |
 | `std::print` / `std::println` | Logging, CLI output | Type-safe formatting checked at compile time, written straight to a stream. Shorter and safer than `iostream`, with no `printf` format bugs. |
-| `std::ranges::to` | Leader's commit calculation, peer lists | Turn a range pipeline (e.g. "all match indices") into a `std::vector` in one expression. |
+| `std::ranges::to` | Leader's commit calculation, `append_entries` batches, peer lists | Turn a range pipeline (e.g. "all match indices") into a `std::vector` in one expression. |
+| `std::views::zip` | `node::take_output` | Walk log indices and committed entries in step, with no manual counter. |
+| `std::unreachable` | `role_name` in the simulation | Mark the end of a `switch` that handles every enum value. |
 | Monadic `std::optional` (`transform`, `or_else`) | Leader hint → client address | Transform "maybe a value" without nested `if`s. |
 
 **C++20** (used throughout, explained where first used): coroutines (`co_await`, with Asio), concepts
@@ -587,7 +593,8 @@ bindings, `std::filesystem`, `[[nodiscard]]`.
 
 ### 6.5 The standard check
 
-From step 0.2 on, `scripts/check.sh` runs everything that must pass after each step:
+From step 0.2 on, `scripts/check.sh` runs everything that must pass after each step. `clang-format` and `ninja`
+come from the tools virtual environment (see `requirements.txt`), so activate it first:
 
 ```sh
 #!/usr/bin/env bash
@@ -652,7 +659,7 @@ cmake --preset conan-debug && cmake --build --preset conan-debug && ctest --pres
 
 **Build:**
 - Add `scripts/check.sh` (section 6.5) and make it executable.
-- `tests/CMakeLists.txt`: use `catch_discover_tests(unit_tests ADD_TAGS_AS_LABELS)`, so Catch2 tags like
+- `tests/unit/CMakeLists.txt`: use `catch_discover_tests(unit_tests ADD_TAGS_AS_LABELS)`, so Catch2 tags like
   `[codec]` become CTest labels.
 - CI (`.github/workflows/ci.yml`):
   - Build matrix: GCC 14 (Ubuntu 24.04), Clang 19 (Ubuntu 24.04, installed via `apt`; use the apt.llvm.org
@@ -682,7 +689,16 @@ code: clang-tidy is a Clang tool, and GCC-specific flags confuse it.
 ```cpp
 namespace hammurabi::wire {
 
-enum class decode_error { truncated, trailing_bytes, invalid_value, too_large };
+enum class decode_error : std::uint8_t {
+    truncated,
+    trailing_bytes,
+    invalid_value,
+    too_large  // a frame header announces more than the limit; produced by step 7.3
+};
+
+// The u32 length prefix for a field of size bytes.
+// Throws std::length_error if it doesn't fit: the caller violated the wire format.
+[[nodiscard]] std::uint32_t wire_length(std::size_t size);
 
 class writer {
 public:
@@ -710,7 +726,13 @@ private:
 
 class reader {
 public:
-    explicit reader(std::span<const std::byte> input) : input_{input} {}
+    // input must outlive the reader
+    explicit reader(std::span<const std::byte> input HAMMURABI_LIFETIMEBOUND) : input_{input} {}
+    // a temporary container would die before the reader is used
+    template<std::ranges::range R>
+        requires(std::convertible_to<R, std::span<const std::byte>> && !std::ranges::borrowed_range<R>)
+    explicit reader(R&&) = delete;
+
     std::uint8_t u8() { return get<std::uint8_t>(); }
     std::uint32_t u32() { return get<std::uint32_t>(); }
     std::uint64_t u64() { return get<std::uint64_t>(); }
@@ -726,6 +748,8 @@ private:
     template<std::unsigned_integral T>
     T get();                         // you write this one: the mirror image of writer::put
 
+    std::span<const std::byte> take_bytes(std::size_t n);
+
     std::span<const std::byte> input_;
     std::optional<decode_error> error_;
 };
@@ -738,6 +762,10 @@ later reads return 0 or an empty value. Decoding a struct is then a straight lis
 check at the end, instead of an `if` after every field. `bytes()` and `string()` check the announced length
 against `remaining()` **before** allocating. Otherwise a malicious length of 4 GB would make us allocate
 4 GB. The fuzzer in step 9.1 checks exactly this.
+
+The reader only views its input, so a temporary buffer would leave it dangling. The deleted constructor makes
+that a compile error for owning containers. `HAMMURABI_LIFETIMEBOUND` (`include/hammurabi/attributes.h`) expands
+to `[[clang::lifetimebound]]`, so Clang also warns about a span bound to a temporary.
 
 **C++ notes:**
 - `std::byteswap` (C++23) reverses the bytes of an integer. Together with `std::endian::native` (C++20), the
@@ -778,7 +806,7 @@ enum class entry_kind : std::uint8_t { noop = 1, command = 2 };
 struct log_entry {
     term_t term = 0;
     entry_kind kind = entry_kind::command;
-    std::vector<std::byte> data;  // the encoded kv command; empty for noop
+    std::vector<std::byte> data{};  // the encoded kv command; empty for noop
     bool operator==(const log_entry&) const = default;
 };
 
@@ -793,7 +821,7 @@ struct append_entries {
     term_t term = 0;
     log_index prev_log_index = 0;
     term_t prev_log_term = 0;
-    std::vector<log_entry> entries;
+    std::vector<log_entry> entries{};
     log_index leader_commit = 0;
     /* operator== */
 };
@@ -810,7 +838,7 @@ using message = std::variant<request_vote, request_vote_reply, append_entries, a
 struct envelope {
     node_id from = 0;
     node_id to = 0;
-    message msg;
+    message msg{};
     bool operator==(const envelope&) const = default;
 };
 
@@ -912,6 +940,8 @@ struct remove { std::string key; };
 struct cas    { std::string key; std::optional<std::string> expected; std::string desired; };
 using operation = std::variant<get, put, remove, cas>;   // each struct also gets a defaulted operator==
 
+enum class operation_type : std::uint8_t { get = 1, put = 2, remove = 3, cas = 4 };  // the tag on the wire
+
 enum class status : std::uint8_t { ok = 1, not_found = 2, cas_failed = 3 };
 struct result { status code = status::ok; std::optional<std::string> value; };
 
@@ -987,10 +1017,10 @@ struct config {
 
 struct hard_state {
     term_t term = 0;
-    std::optional<node_id> voted_for;
+    std::optional<node_id> voted_for{};
     bool operator==(const hard_state&) const = default;
 };
-struct persistent_state { hard_state hard; std::vector<log_entry> log; };
+struct persistent_state { hard_state hard{}; std::vector<log_entry> log{}; };
 
 class storage { /* see section 5.7 */ };
 
@@ -1003,12 +1033,13 @@ private:
     persistent_state state_;
 };
 
-enum class role { follower, candidate, leader };
-struct not_leader { std::optional<node_id> leader_hint; };
+enum class role : std::uint8_t { follower, candidate, leader };
+struct not_leader { std::optional<node_id> leader_hint{}; };
+struct command_too_large {};  // step 4.4
 
 struct output {
-    std::vector<envelope> messages;
-    std::vector<std::pair<log_index, log_entry>> committed;
+    std::vector<envelope> messages{};
+    std::vector<std::pair<log_index, log_entry>> committed{};
 };
 
 class node {
@@ -1017,7 +1048,8 @@ public:
 
     void tick();
     void receive(const envelope& env);
-    [[nodiscard]] std::expected<log_index, not_leader> propose(std::vector<std::byte> command);  // step 4.1
+    [[nodiscard]] std::expected<log_index, std::variant<not_leader, command_too_large>>
+    propose(std::vector<std::byte> command);  // step 4.1; command_too_large: step 4.4
     [[nodiscard]] output take_output();
 
     [[nodiscard]] role current_role() const;
@@ -1025,12 +1057,14 @@ public:
     [[nodiscard]] std::optional<node_id> leader_hint() const;
     [[nodiscard]] log_index commit_index() const;
     [[nodiscard]] std::span<const log_entry> log() const;
+    [[nodiscard]] node_id id() const { return cfg_.self; }
 
 private:
     struct follower_state  { std::optional<node_id> leader; };
     struct candidate_state { std::set<node_id> votes; };
     struct leader_state    { std::map<node_id, log_index> next_index; std::map<node_id, log_index> match_index; };
 
+    void handle(node_id from, const request_vote& m);        // one overload per message type
     void reject_stale(node_id from, const request_vote& m);  // one overload per message type, like handle()
     void adopt_term(term_t term);        // higher term seen: new term, no vote, follower (persisted)
     void become_follower(std::optional<node_id> leader);
@@ -1039,10 +1073,15 @@ private:
     void become_leader();
     void reset_election_timer();         // picks a new random timeout
     void send(node_id to, message msg);  // appends to out_.messages
+    void send_append_entries(node_id peer);  // step 4.1
     void broadcast_append_entries();     // step 2.3
     [[nodiscard]] std::size_t majority() const { return cfg_.members.size() / 2 + 1; }
     [[nodiscard]] log_index last_log_index() const { return log_.size(); }
     [[nodiscard]] term_t term_at(log_index index) const;  // 0 for index 0
+    void truncate_log_from(log_index index);                 // step 4.1
+    void append_to_log(std::span<const log_entry> entries);  // step 4.1; persisted, then added to log_
+    void advance_commit_index(log_index index);              // step 4.1; follower
+    void maybe_advance_commit();                             // step 4.3; leader
 
     config cfg_;
     storage* storage_;             // a pointer: clang-tidy flags reference members
@@ -1217,11 +1256,17 @@ namespace hammurabi::sim {
 
 using tick_t = std::uint64_t;
 
-template<typename Packet>   // Packet has a .to field; reused for client traffic in step 5.3
+template<typename P>
+concept routable = std::copyable<P> && std::same_as<decltype(P::from), decltype(P::to)> &&
+                   std::totally_ordered<decltype(P::from)>;  // std::set<address> needs operator<
+
+template<routable Packet>   // reused for client traffic in step 5.3
 class network {
 public:
+    using address = decltype(Packet::from);
+
     explicit network(std::uint64_t seed);
-    void send(Packet packet, tick_t now);              // applies loss, delay, duplication
+    void send(Packet packet, tick_t now);              // all faults are decided here, not on delivery
     [[nodiscard]] std::vector<Packet> deliver(tick_t now);  // packets due by now, in a fixed order
     // fault controls: step 3.2
 private:
@@ -1234,31 +1279,46 @@ private:
 class cluster {
 public:
     cluster(std::size_t size, std::uint64_t seed);
+    // Neither copyable nor movable: nodes hold raw pointers into storages_.
+    cluster(const cluster&) = delete;
+    cluster& operator=(const cluster&) = delete;
+    cluster(cluster&&) = delete;
+    cluster& operator=(cluster&&) = delete;
+    ~cluster() = default;
+
     void step();                                       // one tick for the whole world
     void run_for(tick_t ticks);
-    bool run_until(const std::function<bool()>& condition, tick_t limit);
+    [[nodiscard]] bool run_until(const std::function<bool()>& condition, tick_t limit);
     [[nodiscard]] std::optional<raft::node_id> leader() const;  // the leader with the highest term, if any
+    // Exactly one leader, everyone else a follower, all in the same term (step 3.2).
+    [[nodiscard]] bool has_stable_leader() const;
     raft::node& node(raft::node_id id);
     network<raft::envelope>& net();
     [[nodiscard]] tick_t now() const;
+    [[nodiscard]] std::string history() const;         // the last 200 events
+    [[nodiscard]] std::string describe() const;        // role and term of every node
 private:
     tick_t now_ = 0;
+    std::mt19937_64 seeder_;                           // derives the seeds of the network and the nodes
     network<raft::envelope> net_;
     std::map<raft::node_id, std::unique_ptr<raft::memory_storage>> storages_;  // survive crashes (phase 6)
     std::map<raft::node_id, std::unique_ptr<raft::node>> nodes_;
+    std::deque<std::string> history_;
+    invariant_checker invariant_checker_;              // step 3.2
 };
 
 } // namespace hammurabi::sim
 ```
 
 `step()` does the same thing in the same order every time:
-1. Deliver all due packets to their nodes, then collect each node's output into the network.
-2. Tick each node (in id order), and collect output again.
+1. Advance the clock and deliver all due packets to their nodes.
+2. In id order, tick each node and move its output into the network.
 3. Check the invariants (step 3.2).
 
-Also add `std::formatter` specializations for the Raft messages, so `std::format("{}", env)` prints e.g.
-`1→2 AppendEntries{term=3, prev=5/2, entries=2, commit=4}`. The simulation keeps the last 200 events. On a
-test failure they are printed via Catch2's `UNSCOPED_INFO`, so you can read what happened.
+Also add `std::formatter` specializations for the Raft messages in `include/hammurabi/raft/format.h`, so
+`std::format("{}", env)` prints e.g. `1→2 AppendEntries{term=3, prev=5/2, entries=2, commit=4}`. The simulation
+keeps the last 200 events. A test prints them with Catch2's `UNSCOPED_INFO(c.describe() << c.history())`, so
+you can read what happened when it fails.
 
 **Why this way:**
 - All randomness in one test comes from one seed. A failing seed can be replayed exactly, as often as needed.
@@ -1279,22 +1339,26 @@ checks that there is never more than one leader per term.
 
 **Build:**
 - Fault controls on `network`, using integer probabilities per mille to keep them deterministic across
-  platforms (section 5.11):
+  platforms (section 5.11). The helpers `chance` and `random_between` live in `tests/sim/random.h`.
 
 ```cpp
 void set_loss(int per_mille);
 void set_duplication(int per_mille);
 void set_delay(tick_t min, tick_t max);
-void partition(std::vector<std::set<raft::node_id>> groups);  // packets only flow inside a group
-void isolate(raft::node_id id);
+// Packets only flow inside a group; nodes not listed form one more group.
+// Replaces any previous partition or isolation.
+void partition(const std::vector<std::set<address>>& groups);
+void isolate(address id);  // cuts id off from everyone, on top of the current partition
 void heal();
 ```
-  (`partition` requires `Packet` to have `.from` as well.)
-- An `invariant_checker` that remembers, for each term, which node was leader. If a second node is leader
-  in a term that already has one, the test fails with the trace (**Election Safety**).
+- An `invariant_checker` that remembers, for each term, which node was leader. The cluster calls
+  `observe_leader(id, term, now)` after each step, for each node in the leader role. If a second node is leader
+  in a term that already has one, it throws `invariant_violation`; the cluster adds the event history to the
+  message, so the test fails with the trace (**Election Safety**).
 - **Chaos test:** for seeds 1…50 (via Catch2 `GENERATE`), run 5 000 ticks while random faults are switched on
-  and off. Then heal everything and require that a leader exists within 500 ticks. Use `CAPTURE(seed)`, so a
-  failure tells you which seed to replay. An environment variable `HAMMURABI_SEED` runs a single seed.
+  and off in epochs of 50–300 ticks, so that a fault lasts long enough for elections to happen. Then heal
+  everything and require `has_stable_leader()` within 500 ticks. Use `CAPTURE(seed)`, so a failure tells you
+  which seed to replay. An environment variable `HAMMURABI_SEED` runs a single seed.
 
 **Why this way:** Single scenario tests ("isolate the leader") check what we thought of. Random faults with
 a checker running all the time find what we did not think of. Checking after **every** step catches a
@@ -1395,15 +1459,19 @@ void node::handle(node_id from, const append_entries_reply& m) {
     if (leader == nullptr) {
         return;  // we are no longer leader (replies from other terms never get here, see receive())
     }
+    const auto it = leader->match_index.find(from);
+    if (it == leader->match_index.end()) {
+        return;  // not one of our peers: don't let operator[] create an entry for it
+    }
     if (m.success) {
-        leader->match_index[from] = std::max(leader->match_index[from], m.match_index);
+        it->second = std::max(it->second, m.match_index);
         leader->next_index[from] = std::max(leader->next_index[from], m.match_index + 1);
         maybe_advance_commit();  // step 4.3
     } else {
         // Go back, but jump straight to the follower's end if its log is short,
         // and never below what we already know matches.
         auto& next = leader->next_index[from];
-        next = std::max(leader->match_index[from] + 1, std::min(next - 1, m.last_log_index + 1));
+        next = std::max(it->second + 1, std::min(next - 1, m.last_log_index + 1));
         send_append_entries(from);
     }
 }
@@ -1445,6 +1513,8 @@ void node::maybe_advance_commit() {
 
 `take_output()` moves all entries from `handed_out_ + 1` up to `commit_index_` into `out.committed` and
 advances `handed_out_`. `become_leader()` now appends a **no-op entry** (`entry_kind::noop`) in the new term.
+`become_leader()` and `propose()` call `maybe_advance_commit()` right after appending, because a 1-node cluster
+gets no replies that would trigger it.
 
 **Why the term check and the no-op? Figure 8 of the paper, step by step** (five nodes S1–S5):
 
@@ -1473,19 +1543,49 @@ turns a lazy view back into a container.
 
 #### Step 4.4: Batching and the datagram size limit
 
-**Goal:** `append_entries` messages never exceed `max_append_bytes`, and a long backlog is sent in several batches.
+**Goal:** The entries in an `append_entries` message never exceed `max_append_bytes`, so the encoded message
+fits in one 1400-byte datagram, and a long backlog is sent in several batches.
 
 **Build:** `send_append_entries` adds entries while `encoded_size` (step 1.3) keeps the total within the
-budget. It always sends at least one entry. `propose` rejects commands larger than the per-command limit.
+budget. The budget counts entries only; the header and fixed fields add 46 bytes, so the largest message is
+1300 + 46 = 1346 bytes. It always sends at least one entry. `propose` returns `command_too_large` when
+`encoded_size(entry) > max_append_bytes`.
 
-**Why this way:** A datagram that gets too big is fragmented or dropped (section 5.6). Since every heartbeat
-re-sends from `next_index`, batches continue automatically: when one batch is confirmed, the next heartbeat
-or reply sends the next one.
+The success branch of `handle(append_entries_reply)` now also sends the next batch:
+
+```cpp
+if (m.success) {
+    if (m.match_index > it->second) {
+        it->second = m.match_index;
+        leader->next_index[from] = std::max(leader->next_index[from], m.match_index + 1);
+        maybe_advance_commit();
+        if (leader->next_index[from] <= last_log_index()) {
+            send_append_entries(from);
+        }
+    }
+}
+```
+
+**Why this way:**
+- A datagram that gets too big is fragmented or dropped (section 5.6).
+- The node never produces bytes here. It only needs a size, so it asks `encoded_size` and leaves `encode` to
+  the host (phase 7). The format knowledge stays in the codec.
+- Every heartbeat re-sends from `next_index`, so batches would continue without the reply-driven send, but only
+  at one batch per heartbeat: 1300 bytes per 50 ms, or about 26 KB/s. A heartbeat still restarts the chain when
+  a message is lost.
+- The send happens only when a reply moved `match_index` forward, so a duplicated or old reply sends nothing.
+  This replaces the `std::max` from step 4.2 and keeps the updates monotonic.
+- `propose` can no longer create an entry that exceeds the budget. "At least one entry" remains for logs that
+  already hold a larger one, for example after lowering `max_append_bytes`. Without it the follower would stall
+  forever.
 
 **Check:** `[replication]`:
-- After 1 000 proposals with a lagging follower, no encoded message is larger than the limit, and the
-  follower catches up.
-- An oversized proposal is rejected.
+- After 1 000 proposals with a lagging follower, no encoded message is larger than 1400 bytes, and the
+  follower catches up. The simulation passes envelopes without encoding them, so the test calls `encode(env)`.
+- A proposal of 1287 bytes is accepted; one of 1288 bytes returns `command_too_large` and leaves the log unchanged.
+- A success reply sends the next batch while the follower is behind. A duplicate of that reply sends nothing,
+  and neither does a reply from a follower that has caught up.
+- An entry larger than `max_append_bytes` in a prepared log is still sent, on its own.
 
 #### Step 4.5: Replication invariants and chaos
 
@@ -1535,7 +1635,7 @@ struct replica_output {
 
 class replica {
 public:
-    replica(raft::config cfg, raft::storage& store, std::map<raft::node_id, std::string> client_addresses);
+    replica(raft::config cfg, raft::storage* store, std::map<raft::node_id, std::string> client_addresses);
     void tick();
     void receive(const raft::envelope& env);
     void submit(request_id id, const kv::request& req);  // the answer comes later, via take_output()
@@ -1551,6 +1651,14 @@ private:
 };
 }
 ```
+
+`submit()` handles the size limit and the errors from `propose`:
+- If the key and value together exceed 1 KiB (section 5.6; for `cas`, count key, expected and desired), answer
+  `rejection::too_large` without touching the log. This limit lives here because Raft only sees opaque bytes.
+- `raft::not_leader` becomes `kv::not_leader` with the leader's client address.
+- `raft::command_too_large` also becomes `rejection::too_large`. With the default budget this can't happen: a
+  1 KiB command is about 1070 bytes as a log entry, session fields from step 5.2 included. It can with a smaller
+  `max_append_bytes`.
 
 `take_output()` drives everything:
 1. Take the node's output.
@@ -1575,6 +1683,7 @@ private:
 - `put` then `get` returns the value.
 - A request to a follower answers `not_leader` with the right address.
 - A pending request is answered with `not_leader` when the leader steps down.
+- A request over the 1 KiB limit answers `rejection::too_large` and adds nothing to the log.
 
 #### Step 5.2: Client sessions (each write runs at most once)
 
@@ -1619,7 +1728,7 @@ and records what every operation saw and when.
 **Build:**
 - `sim::cluster` now holds `replica`s instead of bare nodes.
 - A second `network<client_packet>` carries requests and responses, so they too can be lost, delayed and
-  duplicated.
+  duplicated. `client_packet` must satisfy the `routable` concept: `from` and `to` have the same ordered type.
 - `sim::client` is a small state machine:
   1. Register.
   2. Then repeatedly pick a random operation on a few keys, send it, wait up to N ticks, and retry (same
@@ -2198,6 +2307,7 @@ it. Apple Clang does not ship libFuzzer, so this runs on Linux only.
 
 **Build:**
 - Walk through Appendix A and fill in the test names.
+- Add `HAMMURABI_SEEDS=<n>` to the chaos test, next to `HAMMURABI_SEED`. It runs seeds 1…n.
 - Run the full CI matrix, a sanitizer build and a long chaos run (`HAMMURABI_SEEDS=1000`).
 - Fix any remaining clang-tidy suppressions or justify them in a comment.
 
@@ -2219,7 +2329,7 @@ it. Apple Clang does not ship libFuzzer, so this runs on Linux only.
 | Persist currentTerm, votedFor, log before responding | 2.1, 2.2, 4.1, 6.3–6.4 | `storage` calls |
 | Leader: heartbeats to prevent elections | 2.3 | `tick`, `send_append_entries` |
 | Leader: append client command, respond after applied | 4.1, 5.1 | `propose`, `replica` |
-| Leader: send entries from nextIndex; on failure decrement nextIndex | 4.1, 4.2 | `send_append_entries`, `handle(append_entries_reply)` |
+| Leader: send entries from nextIndex; on failure decrement nextIndex | 4.1, 4.2, 4.4 | `send_append_entries`, `handle(append_entries_reply)` |
 | Leader: commit N if majority matchIndex ≥ N and log[N].term == currentTerm (§5.4.2) | 4.3 | `maybe_advance_commit` |
 | AppendEntries: reply false if term < currentTerm | 2.3 | `node::receive` → `reject_stale` |
 | AppendEntries: reply false if log lacks prevLogIndex/prevLogTerm | 4.1 | `handle(append_entries)` |

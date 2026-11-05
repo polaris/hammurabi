@@ -1,7 +1,7 @@
-#include "hammurabi/raft/messages.h"
-#include "hammurabi/raft/types.h"
-
+#include <hammurabi/raft/codec.h>
+#include <hammurabi/raft/messages.h>
 #include <hammurabi/raft/node.h>
+#include <hammurabi/raft/types.h>
 
 #include <algorithm>
 #include <cassert>
@@ -179,9 +179,15 @@ void node::handle(node_id from, const append_entries_reply& m) {
         return;
     }
     if (m.success) {
-        it->second = std::max(it->second, m.match_index);
-        leader->next_index[from] = std::max(leader->next_index[from], m.match_index + 1);
-        maybe_advance_commit(); // step 4.3
+        // only on progress: a duplicate reply must not trigger another send
+        if (m.match_index > it->second) {
+            it->second = m.match_index;
+            leader->next_index[from] = std::max(leader->next_index[from], m.match_index + 1);
+            maybe_advance_commit();
+            if (leader->next_index[from] <= last_log_index()) {
+                send_append_entries(from);
+            }
+        }
     } else {
         // Go back, but jump straight to the follower's end if its log is short,
         // and never below what we already know matches.
@@ -202,11 +208,14 @@ void node::maybe_advance_commit() {
     }
 }
 
-std::expected<log_index, not_leader> node::propose(std::vector<std::byte> command) {
+std::expected<log_index, std::variant<not_leader, command_too_large>> node::propose(std::vector<std::byte> command) {
     if (current_role() != role::leader) {
         return std::unexpected{not_leader{.leader_hint = leader_hint()}};
     }
     const log_entry e{.term = current_term(), .kind = entry_kind::command, .data = std::move(command)};
+    if (encoded_size(e) > cfg_.max_append_bytes) {
+        return std::unexpected{command_too_large{}};
+    }
     append_to_log(std::span{&e, 1});
     maybe_advance_commit();
     broadcast_append_entries();
@@ -217,12 +226,22 @@ void node::send_append_entries(node_id peer) {
     const auto next_log_index = std::get<leader_state>(role_).next_index.at(peer);
     assert(next_log_index <= last_log_index() + 1);
     const auto prev_log_index = next_log_index - 1;
-    const auto entries = log().subspan(next_log_index - 1);
+    const auto pending = log().subspan(next_log_index - 1);
+    std::size_t count = 0;
+    std::size_t total = 0;
+    for (const auto& e : pending) {
+        total += encoded_size(e);
+        if (count > 0 && total > cfg_.max_append_bytes) {
+            break; // count > 0: always send at least one
+        }
+        ++count;
+    }
+    const auto batch = pending.first(count);
     message msg = append_entries{
         .term = current_term(),
         .prev_log_index = prev_log_index,
         .prev_log_term = term_at(prev_log_index),
-        .entries = std::vector<log_entry>(entries.begin(), entries.end()),
+        .entries = batch | std::ranges::to<std::vector>(),
         .leader_commit = commit_index_,
     };
     send(peer, std::move(msg));

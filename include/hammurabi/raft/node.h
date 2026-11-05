@@ -66,9 +66,12 @@ private:
 };
 
 enum class role : std::uint8_t { follower, candidate, leader };
+
 struct not_leader {
     std::optional<node_id> leader_hint{};
 };
+
+struct command_too_large {};
 
 struct output {
     std::vector<envelope> messages{};
@@ -81,7 +84,8 @@ public:
 
     void tick();
     void receive(const envelope& env);
-    [[nodiscard]] std::expected<log_index, not_leader> propose(std::vector<std::byte> command);
+    [[nodiscard]] std::expected<log_index, std::variant<not_leader, command_too_large>>
+    propose(std::vector<std::byte> command);
     [[nodiscard]] output take_output();
 
     [[nodiscard]] role current_role() const;

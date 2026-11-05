@@ -3,6 +3,7 @@
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <hammurabi/raft/codec.h>
 #include <hammurabi/raft/messages.h>
 #include <hammurabi/raft/node.h>
 #include <hammurabi/raft/types.h>
@@ -13,7 +14,9 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <set>
+#include <span>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -145,6 +148,59 @@ void elect(node& n) {
     n.receive(envelope{.from = 2, .to = 1, .msg = request_vote_reply{.term = n.current_term(), .granted = true}});
     REQUIRE(n.current_role() == role::leader);
     (void)n.take_output(); // take_output is [[nodiscard]]
+}
+
+log_entry command(std::size_t size, term_t term = 1) {
+    return log_entry{.term = term, .kind = entry_kind::command, .data = std::vector<std::byte>(size)};
+}
+
+std::vector<log_entry> commands(std::size_t count, std::size_t size, term_t term = 1) {
+    // Not braced: std::vector{count, entry} reads like a two-element list.
+    std::vector<log_entry> entries(count, command(size, term));
+    return entries;
+}
+
+// Delivers a reply from node 2 to the leader n and returns what n sends in response.
+std::vector<envelope> receive_reply(node& n, const append_entries_reply& reply) {
+    n.receive(envelope{.from = 2, .to = 1, .msg = reply});
+    return n.take_output().messages;
+}
+
+// Makes node 1 leader over the given log and lets node 2 reject, so that the leader goes back to index 1.
+// Returns the entries of the append_entries it answers with: the first batch of the log.
+std::vector<log_entry> first_batch(const std::vector<log_entry>& log) {
+    memory_storage store{persistent_state{.hard = {.term = 1}, .log = log}};
+    node n{make_config(1, {1, 2, 3}), &store};
+    elect(n);
+    const auto out =
+        receive_reply(n, {.term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 0});
+    REQUIRE(out.size() == 1);
+    REQUIRE(std::holds_alternative<append_entries>(out[0].msg));
+    return std::get<append_entries>(out[0].msg).entries;
+}
+
+// Like deliver_all, but drops every message to or from cut_off. Returns the size of the largest encoded message,
+// measured before dropping, so messages to the cut-off node count too.
+std::size_t deliver_measured(std::vector<node>& nodes, std::optional<node_id> cut_off = std::nullopt) {
+    std::size_t largest = 0;
+    while (true) {
+        std::vector<envelope> in_flight;
+        for (auto& n : nodes) {
+            auto output = n.take_output();
+            for (auto& env : output.messages) {
+                largest = std::max(largest, encode(env).size());
+                if (env.from != cut_off && env.to != cut_off) {
+                    in_flight.push_back(std::move(env));
+                }
+            }
+        }
+        if (in_flight.empty()) {
+            return largest;
+        }
+        for (const auto& env : in_flight) {
+            nodes[env.to - 1].receive(env); // node ids are 1..N in vector order
+        }
+    }
 }
 
 } // namespace
@@ -622,14 +678,18 @@ TEST_CASE("propose on a non-leader returns not_leader and changes nothing", "[re
         (void)n.take_output();
         const auto r = n.propose({std::byte{42}});
         REQUIRE_FALSE(r.has_value());
-        REQUIRE(r.error().leader_hint == 2);
+        REQUIRE(std::holds_alternative<not_leader>(r.error()));
+        const auto err = std::get<not_leader>(r.error());
+        REQUIRE(err.leader_hint == 2);
     }
     SECTION("candidate") {
         REQUIRE(ticks_until_election(n) != -1);
         (void)n.take_output();
         const auto r = n.propose({std::byte{42}});
         REQUIRE_FALSE(r.has_value());
-        REQUIRE(r.error().leader_hint == std::nullopt);
+        REQUIRE(std::holds_alternative<not_leader>(r.error()));
+        const auto err = std::get<not_leader>(r.error());
+        REQUIRE(err.leader_hint == std::nullopt);
     }
 
     REQUIRE(n.log().empty());
@@ -931,5 +991,135 @@ TEST_CASE("unknown sender does not change commit index and nothing is sent", "[r
                            .msg = append_entries_reply{
                                .term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 0}});
         REQUIRE(n.take_output().messages.empty());
+    }
+}
+
+TEST_CASE("a lagging follower catches up in batches that each fit in one datagram", "[replication]") {
+    constexpr std::size_t max_datagram = 1400; // section 5.6
+    constexpr std::size_t proposals = 1000;
+    constexpr std::size_t command_size = 200; // 213 bytes as an entry: 6 fit in a batch
+
+    memory_storage store1, store2, store3;
+    std::vector<node> nodes = {
+        node{make_config(1, {1, 2, 3}, 42), &store1},
+        node{make_config(2, {1, 2, 3}, 67), &store2},
+        node{make_config(3, {1, 2, 3}, 12), &store3},
+    };
+    const auto sl = ticks_until_stable_leader(nodes);
+    auto& leader = nodes[sl.leader];
+    auto& lagging = nodes[sl.followers[0]];
+
+    // No ticks while the follower is cut off: it would hear no heartbeats and start an election.
+    std::size_t largest = 0;
+    for (std::size_t i = 0; i < proposals; ++i) {
+        REQUIRE(leader.propose(std::vector<std::byte>(command_size)).has_value());
+        largest = std::max(largest, deliver_measured(nodes, lagging.id()));
+    }
+    REQUIRE(leader.log().size() == proposals + 1);
+    REQUIRE(leader.commit_index() == proposals + 1); // the other follower kept up
+    REQUIRE(lagging.log().size() == 1);              // only the no-op
+
+    // One heartbeat starts the catch-up; from then on, every reply sends the next batch.
+    for (int i = 0; i < config{}.heartbeat_interval_ticks; ++i) {
+        for (auto& n : nodes) {
+            n.tick();
+        }
+        largest = std::max(largest, deliver_measured(nodes));
+    }
+
+    CHECK(largest <= max_datagram);
+    CHECK(std::ranges::equal(lagging.log(), leader.log()));
+    CHECK(lagging.commit_index() == proposals + 1);
+}
+
+TEST_CASE("propose rejects a command whose entry would exceed max_append_bytes", "[replication]") {
+    memory_storage store;
+    node n{make_config(1, {1, 2, 3}), &store};
+    const std::size_t max_command = config{}.max_append_bytes - encoded_size(log_entry{});
+
+    SECTION("leader: a command of exactly the limit is accepted") {
+        elect(n);
+        REQUIRE(n.propose(std::vector<std::byte>(max_command)) == 2);
+        REQUIRE(store.load().log.size() == 2);
+    }
+
+    SECTION("leader: one byte more is rejected and changes nothing") {
+        elect(n);
+        const auto r = n.propose(std::vector<std::byte>(max_command + 1));
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(std::holds_alternative<command_too_large>(r.error()));
+        REQUIRE(n.log().size() == 1); // only the no-op
+        REQUIRE(store.load().log.size() == 1);
+        REQUIRE(n.take_output().messages.empty());
+    }
+
+    SECTION("follower: not_leader comes first, so the client is redirected to the leader") {
+        const auto r = n.propose(std::vector<std::byte>(max_command + 1));
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(std::holds_alternative<not_leader>(r.error()));
+    }
+}
+
+TEST_CASE("a success reply sends the next batch, any other reply sends nothing", "[replication]") {
+    auto log = commands(10, 200); // 213 bytes per entry: 6 fit in a batch
+    memory_storage store{persistent_state{.hard = {.term = 1}, .log = log}};
+    node n{make_config(1, {1, 2, 3}), &store};
+    elect(n);
+    log.push_back(noop_entry(n.current_term())); // index 11
+    REQUIRE(std::ranges::equal(n.log(), log));
+
+    const auto entries = [&log](log_index first, log_index last) {
+        return std::span{log}.subspan(first - 1, last - first + 1) | std::ranges::to<std::vector>();
+    };
+    const auto batch_to_2 = [&n](log_index prev, term_t prev_term, std::vector<log_entry> batch) {
+        return std::vector{envelope{.from = 1,
+                                    .to = 2,
+                                    .msg = append_entries{.term = n.current_term(),
+                                                          .prev_log_index = prev,
+                                                          .prev_log_term = prev_term,
+                                                          .entries = std::move(batch),
+                                                          .leader_commit = 0}}};
+    };
+
+    // Node 2 has nothing: the leader goes back to index 1 and sends the first batch.
+    REQUIRE(receive_reply(n, {.term = n.current_term(), .success = false, .match_index = 0, .last_log_index = 0}) ==
+            batch_to_2(0, 0, entries(1, 6)));
+
+    // Node 2 confirms it: the leader sends the rest without waiting for a heartbeat.
+    const append_entries_reply first_confirmed{
+        .term = n.current_term(), .success = true, .match_index = 6, .last_log_index = 6};
+    REQUIRE(receive_reply(n, first_confirmed) == batch_to_2(6, 1, entries(7, 11)));
+
+    SECTION("a duplicate of that reply sends nothing") {
+        REQUIRE(receive_reply(n, first_confirmed).empty());
+    }
+
+    SECTION("an older reply sends nothing") {
+        REQUIRE(receive_reply(n, {.term = n.current_term(), .success = true, .match_index = 3, .last_log_index = 3})
+                    .empty());
+    }
+
+    SECTION("a reply from a follower that has caught up sends nothing") {
+        REQUIRE(receive_reply(n, {.term = n.current_term(), .success = true, .match_index = 11, .last_log_index = 11})
+                    .empty());
+        REQUIRE(n.commit_index() == 11);
+    }
+}
+
+TEST_CASE("a batch stays within max_append_bytes but always holds at least one entry", "[replication]") {
+    constexpr std::size_t oversized = 2000;
+
+    SECTION("an oversized entry is sent on its own") {
+        REQUIRE(first_batch({command(oversized), command(10)}) == std::vector{command(oversized)});
+    }
+
+    SECTION("an oversized entry does not join a batch that already has one") {
+        REQUIRE(first_batch({command(10), command(oversized)}) == std::vector{command(10)});
+    }
+
+    SECTION("entries that fill the budget exactly are sent together") {
+        const std::size_t fill = config{}.max_append_bytes / 2 - encoded_size(log_entry{});
+        REQUIRE(2 * encoded_size(command(fill)) == config{}.max_append_bytes);
+        REQUIRE(first_batch({command(fill), command(fill), command(1)}) == std::vector{command(fill), command(fill)});
     }
 }
