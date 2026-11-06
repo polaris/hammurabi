@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <format>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <string_view>
@@ -50,28 +51,37 @@ cluster::cluster(std::size_t size, std::uint64_t seed) : seeder_{seed}, net_{see
 }
 
 void cluster::step() {
-    now_ += 1;
-    const auto& packets = net_.deliver(now_);
-    for (const auto& packet : packets) {
-        record(std::format("t={} deliver {}", now_, packet));
-        node(packet.to).receive(packet);
-    }
-    for (const auto& [id, n] : nodes_) {
-        n->tick();
-        auto output = n->take_output();
-        for (auto& packet : output.messages) {
-            record(std::format("t={} send    {}", now_, packet));
-            net_.send(std::move(packet), now_);
+    try {
+        now_ += 1;
+        const auto& packets = net_.deliver(now_);
+        for (const auto& packet : packets) {
+            record(std::format("t={} deliver {}", now_, packet));
+            node(packet.to).receive(packet);
         }
-    }
-    for (const auto& [id, n] : nodes_) {
-        if (n->current_role() == raft::role::leader) {
-            try {
-                invariant_checker_.observe_leader(id, n->current_term(), now_);
-            } catch (const invariant_violation& e) {
-                throw invariant_violation{std::format("{}\n{}", e.what(), history())};
+        for (const auto& [id, n] : nodes_) {
+            n->tick();
+            auto output = n->take_output();
+            for (auto& packet : output.messages) {
+                record(std::format("t={} send    {}", now_, packet));
+                net_.send(std::move(packet), now_);
+            }
+            for (const auto& [index, entry] : output.committed) {
+                record(std::format("t={} commit  node {} index {} {}", now_, id, index, entry));
+            }
+            invariant_checker_.observe_committed(id, output.committed);
+        }
+        for (const auto& [id, n] : nodes_) {
+            if (n->current_role() == raft::role::leader) {
+                invariant_checker_.observe_leader(id, n->current_term(), n->log(), now_);
             }
         }
+        for (auto a = nodes_.begin(); a != nodes_.end(); ++a) {
+            for (auto b = std::next(a); b != nodes_.end(); ++b) {
+                invariant_checker::check_log_matching(a->first, a->second->log(), b->first, b->second->log());
+            }
+        }
+    } catch (const invariant_violation& e) {
+        throw invariant_violation{std::format("{}\n{}", e.what(), history())};
     }
 }
 

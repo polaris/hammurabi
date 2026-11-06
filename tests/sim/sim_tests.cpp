@@ -13,6 +13,8 @@
 #include <sim/types.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -38,8 +40,8 @@ struct test_packet {
     bool operator==(const test_packet&) const = default;
 };
 
-// HAMMURABI_SEED=<n> replays a single seed; otherwise seeds 1…50.
-std::vector<std::uint64_t> chaos_seeds() {
+// HAMMURABI_SEED=<n> replays a single seed; otherwise seeds 1…count.
+std::vector<std::uint64_t> chaos_seeds(std::uint64_t count = 50) {
     if (const char* env = std::getenv("HAMMURABI_SEED")) {
         const std::string_view text{env};
         std::uint64_t seed = 0;
@@ -49,7 +51,7 @@ std::vector<std::uint64_t> chaos_seeds() {
         }
         return {seed};
     }
-    return std::views::iota(std::uint64_t{1}, std::uint64_t{51}) | std::ranges::to<std::vector>();
+    return std::views::iota(std::uint64_t{1}, count + 1) | std::ranges::to<std::vector>();
 }
 
 // A new fault configuration for one epoch: maybe a partition, plus some loss, duplication and delay.
@@ -244,9 +246,96 @@ TEST_CASE("invariant_checker: a second leader in the same term throws", "[sim]")
     using namespace hammurabi::sim;
 
     invariant_checker check;
-    check.observe_leader(1, 5, 100);
-    check.observe_leader(1, 5, 101); // same leader again: fine
-    CHECK_THROWS_AS(check.observe_leader(3, 5, 250), invariant_violation);
+    check.observe_leader(1, 5, {}, 100);
+    check.observe_leader(1, 5, {}, 101); // same leader again: fine
+    CHECK_THROWS_AS(check.observe_leader(3, 5, {}, 250), invariant_violation);
+}
+
+namespace {
+
+// A log with one entry per term; the data byte tells entries of the same term apart.
+std::vector<hammurabi::raft::log_entry> make_log(std::initializer_list<hammurabi::raft::term_t> terms,
+                                                 std::byte data = std::byte{0}) {
+    std::vector<hammurabi::raft::log_entry> log;
+    for (const auto term : terms) {
+        log.push_back({.term = term, .data = {data}});
+    }
+    return log;
+}
+
+} // namespace
+
+TEST_CASE("invariant_checker: log matching accepts logs that differ only above the anchor", "[sim]") {
+    using namespace hammurabi::sim;
+
+    const auto equal = make_log({1, 1, 2});
+    const auto longer = make_log({1, 1, 2, 2, 3});
+    const auto diverged = make_log({1, 1, 3, 3});
+    const auto other_terms = make_log({2, 2}, std::byte{1});
+
+    CHECK_NOTHROW(invariant_checker::check_log_matching(1, equal, 2, equal));
+    CHECK_NOTHROW(invariant_checker::check_log_matching(1, equal, 2, longer));      // a follower that lags behind
+    CHECK_NOTHROW(invariant_checker::check_log_matching(1, longer, 2, diverged));   // uncommitted tail from term 3
+    CHECK_NOTHROW(invariant_checker::check_log_matching(1, equal, 2, other_terms)); // no common (index, term) pair
+    CHECK_NOTHROW(invariant_checker::check_log_matching(1, {}, 2, equal));
+}
+
+TEST_CASE("invariant_checker: log matching catches a differing prefix", "[sim]") {
+    using namespace hammurabi::sim;
+
+    auto a = make_log({1, 1, 2});
+    auto b = a;
+
+    SECTION("an earlier entry differs") {
+        b[1].data = {std::byte{1}};
+    }
+    SECTION("the anchor itself differs") {
+        b[2].data = {std::byte{1}};
+    }
+    SECTION("the only common pair is at index 1") {
+        a = make_log({1, 2});
+        b = make_log({1, 3}, std::byte{1});
+    }
+    SECTION("the shorter log is the second one") {
+        a = make_log({1, 1, 2, 2});
+        b[0].data = {std::byte{1}};
+    }
+    CHECK_THROWS_AS(invariant_checker::check_log_matching(1, a, 2, b), invariant_violation);
+}
+
+TEST_CASE("invariant_checker: the same index handed out twice must be the same entry", "[sim]") {
+    using namespace hammurabi::sim;
+    using hammurabi::raft::log_entry;
+
+    invariant_checker check;
+    check.observe_committed(1, {{1, log_entry{.term = 1}}, {2, log_entry{.term = 1, .data = {std::byte{7}}}}});
+    check.observe_committed(2, {{1, log_entry{.term = 1}}}); // another node, same entry: fine
+    CHECK_THROWS_AS(check.observe_committed(3, {{2, log_entry{.term = 1, .data = {std::byte{8}}}}}),
+                    invariant_violation);
+}
+
+TEST_CASE("invariant_checker: a new leader must hold every committed entry", "[sim]") {
+    using namespace hammurabi::sim;
+    using hammurabi::raft::log_entry;
+
+    invariant_checker check;
+    const auto log = make_log({1, 1, 2});
+    check.observe_committed(1, {{1, log[0]}, {2, log[1]}});
+
+    CHECK_NOTHROW(check.observe_leader(1, 3, log, 100));
+    CHECK_THROWS_AS(check.observe_leader(2, 4, make_log({1}), 200), invariant_violation); // index 2 missing
+    CHECK_THROWS_AS(check.observe_leader(3, 5, make_log({1, 1}, std::byte{1}), 300), invariant_violation);
+}
+
+TEST_CASE("invariant_checker: leader completeness is checked only when a term's leader is first seen", "[sim]") {
+    using namespace hammurabi::sim;
+    using hammurabi::raft::log_entry;
+
+    invariant_checker check;
+    check.observe_leader(1, 3, {}, 100);
+    check.observe_committed(1, {{1, log_entry{.term = 3}}});
+    // Same leader, same term: not rechecked, so the empty log passes. Checking every step would cost O(committed).
+    CHECK_NOTHROW(check.observe_leader(1, 3, {}, 101));
 }
 
 TEST_CASE("cluster: an isolated leader is replaced, and steps down after heal", "[sim]") {
@@ -406,4 +495,47 @@ TEST_CASE("cluster: chaos, then heal → a stable leader", "[sim]") {
     const bool stable = c.run_until([&c]() -> bool { return c.has_stable_leader(); }, 500);
     UNSCOPED_INFO(c.describe() << c.history());
     REQUIRE(stable);
+}
+
+TEST_CASE("cluster: chaos with proposals keeps every safety invariant", "[sim]") {
+    using namespace hammurabi::sim;
+    using hammurabi::raft::role;
+
+    constexpr std::size_t size = 5;
+    constexpr tick_t chaos_ticks = 5000;
+
+    // Fewer seeds than the election chaos test: checking Log Matching on every step makes each seed about 0.6 s.
+    const auto seed = GENERATE(from_range(chaos_seeds(20)));
+    CAPTURE(seed);
+
+    cluster c{size, seed};
+    std::mt19937_64 chaos{seed ^ 0x9E3779B97F4A7C15};
+    // Every command is distinct, so two entries of the same term at the same index differ if Raft mixes them up.
+    std::uint64_t next_command = 0;
+    std::uint64_t accepted = 0;
+
+    // The cluster checks the invariants after every step and throws on a violation, with the history attached.
+    while (c.now() < chaos_ticks) {
+        apply_random_faults(c.net(), chaos, size);
+        const auto epoch_end = std::min(c.now() + random_between(chaos, 50, 300), chaos_ticks);
+        while (c.now() < epoch_end) {
+            // Every node in the leader role, so stale leaders in a minority also append entries that must be
+            // overwritten later.
+            for (hammurabi::raft::node_id id = 1; id <= size; ++id) {
+                if (c.node(id).current_role() == role::leader && random_between(chaos, 0, 9) == 0) {
+                    const auto command = std::bit_cast<std::array<std::byte, sizeof(next_command)>>(next_command++);
+                    if (c.node(id).propose({command.begin(), command.end()})) {
+                        ++accepted;
+                    }
+                }
+            }
+            c.step();
+        }
+    }
+
+    calm(c.net());
+    const bool stable = c.run_until([&c]() -> bool { return c.has_stable_leader(); }, 500);
+    UNSCOPED_INFO(c.describe() << c.history());
+    REQUIRE(stable);
+    CHECK(accepted > 0); // otherwise the test only replicated no-ops
 }
