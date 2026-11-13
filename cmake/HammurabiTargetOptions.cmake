@@ -6,6 +6,7 @@
 function(hammurabi_target_warnings target)
     target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+            -Wimplicit-fallthrough # in GCC's -Wextra, but not in clang's
             $<$<BOOL:${HAMMURABI_WARNINGS_AS_ERRORS}>:-Werror>)
 endfunction()
 
