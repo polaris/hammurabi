@@ -1755,35 +1755,80 @@ bytes.
 **Goal:** Implement section 5.8: registering, sequence numbers, deduplication and deterministic eviction.
 
 **Build:**
-- `kv::operation` gains `register_client`.
-- `kv::request` becomes `{ std::uint64_t client_id; std::uint64_t sequence; operation op; }`. `client_id = 0`
-  is allowed only for `get` and `register_client`.
-- The log stores a `kv::command { client_id, sequence, op }`.
-- `state_machine::apply(raft::log_index index, const command& cmd)`:
+- `kv::operation` gains `register_client` (no fields, `operation_type::register_client = 5`).
+- `kv::request` becomes `{ std::uint64_t client_id; std::uint64_t sequence; operation op; }`.
+- The log stores a `kv::command { client_id, sequence, op }`: `u64 client_id │ u64 sequence │ operation`. It
+  replaces `decode_operation` as the log decoder; the golden-bytes test pins the new layout.
+- `kv::rejection` moves from `protocol.h` to `command.h`, next to `status` and `result`: the state machine now
+  produces rejections too, and the protocol keeps using the same type.
+- The client id comes back explicitly, as its own answer type:
+
+```cpp
+// command.h
+struct registered { std::uint64_t client_id; };
+using reply = std::variant<result, registered>;   // what an executed command answers
+
+// protocol.h
+using response = std::variant<result, registered, not_leader, rejection>;
+```
+
+  The client format gets `type 4 = registered │ u64 client_id`.
+- `state_machine` takes `std::size_t max_sessions = 10'000` in its constructor, so tests can evict with 2 or 3.
+- `std::expected<reply, rejection> state_machine::apply(raft::log_index index, const command& cmd)`:
 
 ```cpp
 struct session { std::uint64_t last_sequence = 0; result last_result; raft::log_index last_used = 0; };
 std::map<std::uint64_t, session> sessions_;   // keyed by client id
 
 // apply():
-//   register_client           → create session (client id = index); return it in result.value
+//   register_client           → create session (client id = index); return registered{index}
 //   client_id == 0 (get only) → execute, no session
-//   unknown client id         → status::session_expired (never execute!)
-//   seq == last_sequence      → return last_result (a retry; do not execute again)
+//   unknown client id         → rejection::session_expired (never execute!)
+//   seq == last_sequence      → return last_result (a retry; do not execute again), last_used = index
 //   seq == last_sequence + 1  → execute, store result, last_used = index
-//   anything else             → reject (protocol violation)
+//   anything else             → rejection::malformed (protocol violation; not executed, not stored)
 //   then: if sessions_.size() > max_sessions → erase the one with the smallest last_used
 ```
 
+`submit()` checks the request rules before anything reaches the log, and answers `rejection::malformed` if one
+is broken. The decoder only checks shape (step 5.1), so these are policy:
+- `client_id = 0` only for `get` and `register_client`, and then `sequence = 0`.
+- `register_client` always has `client_id = 0`.
+- A real client id needs `sequence ≥ 1`. Without this check, `sequence = 0` right after registering would equal
+  `last_sequence` and be answered as a "retry".
+
+In `take_output()`, the `std::expected` turns into a `response`: the error becomes the `rejection`
+alternative, and a `std::visit` copies the `reply` alternative (`result` or `registered`) into the `response`.
+The pending client's answer type therefore no longer depends on the operation. `payload_bytes` counts
+`register_client` as 0 bytes.
+
 **Why this way:** See section 5.8. The decision lives inside the state machine, so it is part of the
 replicated, deterministic state: every node, including one replaying its log after a restart, decides the
-same.
+same. That is also why sessions need no persistence of their own in phase 6: replaying the log rebuilds them.
+- `std::expected<result, rejection>` says what happens: either the operation ran (with a result such as
+  `cas_failed`), or it was refused without running. A `status::session_expired` would mix both and give the
+  protocol two ways to say the same thing.
+- `registered` instead of the id as text in `result.value`: invalid states cannot be expressed. A `result` never
+  carries a client id, `registered` never carries a status, and the client does not parse a number out of a
+  string. `session::last_result` stays a `result`: `register_client` has no session, so it is never deduplicated.
+- A retry refreshes `last_used`: the client is evidently still alive. This is deterministic, since `index` is
+  the same on every node.
+- Eviction scans for the smallest `last_used` (`std::ranges::min_element` with a projection). That is O(n), but
+  only `register_client` grows the map, so only it can trigger an eviction. A second index
+  (`std::map<log_index, client_id>`) would make it O(log n) at the price of keeping two maps consistent.
 
 **Check:** `[kv]` and `[replica]` tests:
 - The same `(client, seq)` applied twice executes once and returns the same result twice.
+- A sequence gap (or an older sequence number) answers `malformed` and changes nothing.
 - **The `cas` example from section 5.8** in a replica test: commit a `cas`, drop the response, retry at the
   new leader → the client gets "ok", not "cas failed".
-- Eviction removes the least recently used session; an evicted client gets `session_expired`.
+- Eviction removes the least recently used session (a retry counts as use); an evicted client gets
+  `session_expired`.
+- `submit()` answers `malformed` for every broken request rule, without touching the log.
+- `register_client` answers `registered{index}` on every node.
+
+The `[protocol]` tests cover the new request fields and `registered` the way step 5.1 covers the rest: round
+trips, every truncation, trailing bytes, golden bytes.
 
 #### Step 5.3: Simulated clients and recorded histories
 
