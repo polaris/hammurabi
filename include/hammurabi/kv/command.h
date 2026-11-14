@@ -1,6 +1,7 @@
 #ifndef HAMMURABI_KV_COMMAND_H
 #define HAMMURABI_KV_COMMAND_H
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <variant>
@@ -31,6 +32,14 @@ struct cas {
 };
 
 using operation = std::variant<get, put, remove, cas>;
+
+enum class status : std::uint8_t { ok = 1, not_found = 2, cas_failed = 3 };
+
+struct result {
+    status code = status::ok;
+    std::optional<std::string> value{};
+    bool operator==(const result&) const = default;
+};
 
 } // namespace hammurabi::kv
 

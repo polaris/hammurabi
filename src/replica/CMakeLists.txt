@@ -1,0 +1,8 @@
+add_library(hammurabi_replica STATIC replica.cpp)
+
+target_include_directories(hammurabi_replica PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(hammurabi_replica PUBLIC hammurabi_raft hammurabi_kv)
+
+hammurabi_target_warnings(hammurabi_replica)
+hammurabi_target_sanitizers(hammurabi_replica)
+hammurabi_target_clang_tidy(hammurabi_replica)

@@ -23,6 +23,13 @@ void writer::string(std::string_view text) {
     bytes(std::as_bytes(std::span{text}));
 }
 
+void writer::optional_string(std::optional<std::string_view> text) {
+    boolean(text.has_value());
+    if (text.has_value()) {
+        string(*text);
+    }
+}
+
 bool reader::boolean() {
     const auto value = u8();
     if (value == 0) {
@@ -45,6 +52,13 @@ std::string reader::string() {
     const auto size = u32();
     const auto s = take_bytes(size);
     return s | std::views::transform([](std::byte b) { return static_cast<char>(b); }) | std::ranges::to<std::string>();
+}
+
+std::optional<std::string> reader::optional_string() {
+    if (!boolean()) {
+        return std::nullopt;
+    }
+    return string();
 }
 
 void reader::fail(decode_error error) {

@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <expected>
 #include <map>
-#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -16,13 +15,6 @@
 namespace hammurabi::kv {
 
 enum class operation_type : std::uint8_t { get = 1, put = 2, remove = 3, cas = 4 };
-
-enum class status : std::uint8_t { ok = 1, not_found = 2, cas_failed = 3 };
-
-struct result {
-    status code = status::ok;
-    std::optional<std::string> value;
-};
 
 class state_machine {
 public:
@@ -40,6 +32,9 @@ private:
 
 [[nodiscard]] std::vector<std::byte> encode(const operation& op);
 [[nodiscard]] std::expected<operation, wire::decode_error> decode_operation(std::span<const std::byte> bytes);
+
+void write(wire::writer& w, const operation& op);
+[[nodiscard]] operation read_operation(wire::reader& r);
 
 } // namespace hammurabi::kv
 

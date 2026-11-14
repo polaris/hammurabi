@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -278,6 +279,31 @@ TEST_CASE("reading string whose length exceeds the input reports truncated", "[c
     const auto result = r.finish();
     REQUIRE_FALSE(result);
     REQUIRE(result.error() == hammurabi::wire::decode_error::truncated);
+}
+
+TEST_CASE("round trip for optional_string", "[codec][writer][reader]") {
+    const auto value = GENERATE(as<std::optional<std::string>>{}, std::nullopt, "", "hammurabi");
+    CAPTURE(value.has_value());
+
+    hammurabi::wire::writer w;
+    w.optional_string(value);
+    const auto buffer = std::move(w).take();
+
+    hammurabi::wire::reader r(buffer);
+    REQUIRE(r.optional_string() == value);
+    REQUIRE(r.finish());
+}
+
+TEST_CASE("writer encodes optional_string as a present flag, then the string if present", "[codec][writer]") {
+    hammurabi::wire::writer absent;
+    absent.optional_string(std::nullopt);
+    const auto absent_buffer = std::move(absent).take();
+    REQUIRE(absent_buffer == to_bytes({0x00}));
+
+    hammurabi::wire::writer present;
+    present.optional_string("hi");
+    const auto present_buffer = std::move(present).take();
+    REQUIRE(present_buffer == to_bytes({0x01, 0x00, 0x00, 0x00, 0x02, 'h', 'i'}));
 }
 
 TEST_CASE("the first decode error sticks", "[codec][reader]") {

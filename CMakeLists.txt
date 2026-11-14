@@ -27,6 +27,7 @@ add_subdirectory(apps/server)
 add_subdirectory(src/wire)
 add_subdirectory(src/raft)
 add_subdirectory(src/kv)
+add_subdirectory(src/replica)
 
 if(BUILD_TESTING)
     find_package(Catch2 3 REQUIRED)

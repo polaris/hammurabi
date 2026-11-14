@@ -1,3 +1,5 @@
+#include "kv_string_makers.h" // IWYU pragma: keep
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/generators/catch_generators_range.hpp>
@@ -6,11 +8,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <vector>
 
 namespace {
+
+std::vector<std::byte> to_bytes(std::initializer_list<std::uint8_t> values) {
+    return values | std::views::transform([](std::uint8_t v) { return std::byte{v}; }) | std::ranges::to<std::vector>();
+}
 
 std::vector<hammurabi::kv::operation> sample_operations() {
     using namespace hammurabi;
@@ -198,7 +206,7 @@ TEST_CASE("decode operation with unknown type", "[kv]") {
     CAPTURE(static_cast<int>(type));
 
     auto bytes = kv::encode(kv::get{.key = "foo"});
-    bytes[0] = std::byte{type};
+    bytes.front() = std::byte{type};
 
     const auto result = kv::decode_operation(bytes);
     REQUIRE_FALSE(result.has_value());
@@ -217,4 +225,15 @@ TEST_CASE("decode operation with trailing bytes", "[kv]") {
     const auto result = kv::decode_operation(bytes);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == wire::decode_error::trailing_bytes);
+}
+
+TEST_CASE("cas encoding is stable", "[kv]") {
+    using namespace hammurabi;
+
+    // operation type cas, key "k", expected present "a", desired "b"
+    CHECK(kv::encode(kv::operation{kv::cas{.key = "k", .expected = "a", .desired = "b"}}) ==
+          to_bytes({4, 0, 0, 0, 1, 'k', 1, 0, 0, 0, 1, 'a', 0, 0, 0, 1, 'b'}));
+    // operation type cas, key "k", expected absent, desired "b"
+    CHECK(kv::encode(kv::operation{kv::cas{.key = "k", .expected = std::nullopt, .desired = "b"}}) ==
+          to_bytes({4, 0, 0, 0, 1, 'k', 0, 0, 0, 0, 1, 'b'}));
 }

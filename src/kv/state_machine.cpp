@@ -3,6 +3,7 @@
 #include <hammurabi/wire/codec.h>
 
 #include <optional>
+#include <string>
 #include <utility>
 #include <variant>
 
@@ -25,11 +26,8 @@ void write(wire::writer& w, const remove& op) {
 
 void write(wire::writer& w, const cas& op) {
     w.string(op.key);
+    w.optional_string(op.expected);
     w.string(op.desired);
-    w.boolean(op.expected.has_value());
-    if (op.expected.has_value()) {
-        w.string(*op.expected);
-    }
 }
 
 constexpr operation_type type_of(const get&) {
@@ -95,45 +93,39 @@ result state_machine::execute(const cas& op) {
 
 std::vector<std::byte> encode(const operation& op) {
     wire::writer w;
-    w.u8(std::to_underlying(std::visit([](const auto& m) { return type_of(m); }, op)));
-    std::visit([&w](const auto& m) { write(w, m); }, op);
+    write(w, op);
     return std::move(w).take();
 }
 
 std::expected<operation, wire::decode_error> decode_operation(std::span<const std::byte> bytes) {
-    if (bytes.empty()) {
-        return std::unexpected(wire::decode_error::truncated);
-    }
     wire::reader r{bytes};
-    const auto op_type = static_cast<operation_type>(r.u8());
-    operation op;
-    switch (op_type) {
-        case operation_type::get:
-            op = get{.key = r.string()};
-            break;
-        case operation_type::put:
-            op = put{.key = r.string(), .value = r.string()};
-            break;
-        case operation_type::remove:
-            op = remove{.key = r.string()};
-            break;
-        case operation_type::cas: {
-            const auto key = r.string();
-            const auto desired = r.string();
-            std::optional<std::string> expected;
-            if (r.boolean()) {
-                expected = r.string();
-            }
-            op = cas{.key = key, .expected = expected, .desired = desired};
-        } break;
-        default:
-            return std::unexpected(wire::decode_error::invalid_value);
-    }
-    const auto result = r.finish();
-    if (!result) {
-        return std::unexpected(result.error());
+    auto op = read_operation(r);
+    const auto done = r.finish();
+    if (!done) {
+        return std::unexpected(done.error());
     }
     return op;
+}
+
+void write(wire::writer& w, const operation& op) {
+    w.u8(std::to_underlying(std::visit([](const auto& m) { return type_of(m); }, op)));
+    std::visit([&w](const auto& m) { write(w, m); }, op);
+}
+
+operation read_operation(wire::reader& r) {
+    // No default: -Wswitch then points here when operation_type gets a new value.
+    switch (static_cast<operation_type>(r.u8())) {
+        case operation_type::get:
+            return get{.key = r.string()};
+        case operation_type::put:
+            return put{.key = r.string(), .value = r.string()};
+        case operation_type::remove:
+            return remove{.key = r.string()};
+        case operation_type::cas:
+            return cas{.key = r.string(), .expected = r.optional_string(), .desired = r.string()};
+    }
+    r.fail(wire::decode_error::invalid_value);
+    return get{}; // never used: finish() reports the error
 }
 
 } // namespace hammurabi::kv

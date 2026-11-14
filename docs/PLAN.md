@@ -1618,8 +1618,12 @@ random faults, a passing test suite is strong evidence of correctness, not just 
 
 ```cpp
 namespace hammurabi::kv {
+// command.h: status and result live next to operation; the state machine and the protocol both use them.
+struct result { status code = status::ok; std::optional<std::string> value{}; };
+
+// protocol.h
 struct request { operation op; };   // step 5.2 adds client_id and sequence
-struct not_leader { std::optional<std::string> leader_address; };  // client address of the leader, if known
+struct not_leader { std::optional<std::string> leader_address{}; };  // client address of the leader, if known
 enum class rejection : std::uint8_t { too_large = 1, malformed = 2, session_expired = 3 };
 using response = std::variant<result, not_leader, rejection>;
 // + encode/decode for request and response
@@ -1627,6 +1631,9 @@ using response = std::variant<result, not_leader, rejection>;
 
 namespace hammurabi {
 using request_id = std::uint64_t;   // chosen by the host; identifies the waiting client
+
+// Key and value bytes per request, so every command fits into one UDP datagram (section 5.6).
+inline constexpr std::size_t max_payload_bytes = 1024;
 
 struct replica_output {
     std::vector<raft::envelope> messages;
@@ -1641,9 +1648,10 @@ public:
     void submit(request_id id, const kv::request& req);  // the answer comes later, via take_output()
     [[nodiscard]] replica_output take_output();
     [[nodiscard]] const raft::node& node() const;
+    [[nodiscard]] const kv::state_machine& machine() const;   // tests check that every copy agrees
 private:
     struct pending { raft::term_t term; request_id id; };
-    raft::node node_;
+    raft::node node_;   // declared before client_addresses_: the constructor checks the addresses first
     kv::state_machine machine_;
     std::map<raft::log_index, pending> pending_;   // which client waits for which log index
     std::map<raft::node_id, std::string> client_addresses_;
@@ -1652,38 +1660,95 @@ private:
 }
 ```
 
+**Two formats, kept apart.** The **log format** (`kv::encode(operation)`) is what Raft replicates and, from
+phase 6, writes to disk. The **client format** (`kv::encode(request)`, `kv::encode(response)`) is what the CLI
+and a server exchange over TCP in phase 7. Only the client format carries a version byte and the answers that
+never reach the log (`not_leader`, `rejection`). `submit()` therefore proposes `kv::encode(req.op)`, never the
+encoded request. Both formats are built from the same composable helpers, `kv::write(writer&, const operation&)`
+and `kv::read_operation(reader&)`, which leave `finish()` to the caller.
+
+The client format:
+
+```
+request:   u8 version │ operation
+response:  u8 version │ u8 type │ body
+           type 1 = result      u8 status │ optional value
+           type 2 = not_leader  optional address
+           type 3 = rejection   u8 rejection
+optional string = u8 present (0/1) │ [string]      (wire::writer/reader::optional_string)
+```
+
+The decoders check shape, not policy: a 2 KiB `put` decodes fine, so the replica can answer `too_large`
+instead of `malformed`.
+
+The constructor throws `std::runtime_error` if the client addresses don't name exactly the configured members.
+In phase 7 they come from the command line, so this is bad input, not a programming error.
+
 `submit()` handles the size limit and the errors from `propose`:
-- If the key and value together exceed 1 KiB (section 5.6; for `cas`, count key, expected and desired), answer
-  `rejection::too_large` without touching the log. This limit lives here because Raft only sees opaque bytes.
+- If the key and value together exceed `max_payload_bytes` (section 5.6; for `cas`, count key, expected and
+  desired), answer `rejection::too_large` without touching the log. This limit lives here because Raft only
+  sees opaque bytes.
 - `raft::not_leader` becomes `kv::not_leader` with the leader's client address.
 - `raft::command_too_large` also becomes `rejection::too_large`. With the default budget this can't happen: a
   1 KiB command is about 1070 bytes as a log entry, session fields from step 5.2 included. It can with a smaller
   `max_append_bytes`.
 
 `take_output()` drives everything:
-1. Take the node's output.
-2. Apply every committed entry in order, skipping no-ops.
-3. If a request is pending at that index **with the same term**, answer it with the result.
-4. If the term differs, our entry was overwritten, so answer `not_leader`.
-5. If the node is no longer leader, answer every remaining pending request with `not_leader`. The client
-   retries elsewhere; with sessions (next step) that is safe.
+1. Take the node's output and pass its messages on.
+2. For every committed entry, in order: apply it if it is a command (a no-op has no result). An entry that does
+   not decode throws: only `submit()` writes commands, so this is corruption (a damaged log file in phase 6).
+3. Look up `pending_` at that index, **for no-ops too**: a new leader's no-op may have taken the index a client
+   waits for. Same term: answer with the result. Different term: the entry was overwritten, so answer
+   `not_leader`.
+4. **Then**, if the node is no longer leader, answer every remaining pending request with `not_leader`. The
+   client retries elsewhere; with sessions (next step) that is safe.
+5. Return the output and start a fresh one (`std::exchange(out_, {})`).
 
 **Why this way:**
 - All answers flow through one channel (`responses`), including the immediate `not_leader` rejections. The
   host (phase 7) and the simulation (step 5.3) use the replica the same way. The simulation therefore tests
   the **real** request path, not a test-only copy.
-- The term check in `pending` matters. Index 12 may now hold a different command from a newer leader, and
-  answering with *its* result would be wrong.
+- The term check in `pending` matters. One leader per term writes each index once, so the same term means
+  our entry. A different term means a newer leader's entry, and if that entry is another client's `put`,
+  answering with *its* result would tell our client "ok" for a write that never happened.
+- **Apply first, then flush.** One `receive()` can both demote the old leader and commit its entry: the new
+  leader's `append_entries` carries a higher term and a commit index that covers the entry. Applying first
+  gives the client the real result instead of a `not_leader` that forces a needless retry.
+- **The flush is needed** because the waiting index may never be reached. If the new leader's log is shorter
+  and no client writes, nothing ever commits there again.
 
-**C++ notes:** `node.leader_hint().transform([&](raft::node_id id) { return client_addresses_.at(id); })` turns
-"maybe a leader id" into "maybe an address" without an `if`. This is the monadic interface of `std::optional`
-(C++23).
+**C++ notes:**
+- `node.leader_hint().transform([&](raft::node_id id) { return client_addresses_.at(id); })` turns "maybe a
+  leader id" into "maybe an address" without an `if`. This is the monadic interface of `std::optional` (C++23).
+- `std::visit` with the `overloaded` helper maps `propose`'s error variant and counts the payload of each
+  operation kind. A new alternative breaks the build instead of being ignored silently.
+- `[[maybe_unused]] const auto [_, inserted] = pending_.try_emplace(...); assert(inserted);`: without the
+  attribute, a Release build (`NDEBUG`) warns about the unused binding.
+- The enum readers (`read_status`, `read_rejection`, `read_operation`) use a `switch` **without** `default`,
+  so `-Wswitch` points at them when step 5.2 adds a value.
+- `kv/format.h` gives `std::formatter`s for operations, requests and responses; `tests/unit/kv_string_makers.h`
+  hands them to Catch2, so a failed check prints `Result{ok, "1"} == NotLeader{"c2"}` instead of `{?}`.
 
-**Check:** `[replica]` unit tests with three replicas and `deliver_all`:
-- `put` then `get` returns the value.
-- A request to a follower answers `not_leader` with the right address.
-- A pending request is answered with `not_leader` when the leader steps down.
-- A request over the 1 KiB limit answers `rejection::too_large` and adds nothing to the log.
+**Also in this step:** `-Wimplicit-fallthrough` joins the warning flags (GCC has it in `-Wextra`, clang does
+not). `cas` is encoded in member order (key, expected, desired), pinned by a golden-bytes test before phase 6
+stores it on disk. Optional members get `{}`, so GCC's `-Wmissing-field-initializers` stays quiet when a test
+leaves them out of a designated initializer.
+
+**Check:** `[replica]` unit tests. `test_cluster` runs three replicas with `deliver_all`, and can isolate a
+node, block single links and tick one replica alone:
+- The constructor rejects client addresses that don't match the members.
+- `put` then `get` returns the value; followers apply committed entries too (after the next heartbeat);
+  `not_found` and `cas_failed` results pass through unchanged.
+- A single-node cluster answers at the next `take_output()`.
+- A request to a follower answers `not_leader` with the right address, at once, without side effects.
+- Exactly 1 KiB is accepted; one byte more answers `rejection::too_large` and adds nothing to the log, for
+  every operation kind; Raft's `command_too_large` also answers `too_large`.
+- A pending request is answered with `not_leader` when the leader steps down (the flush).
+- An entry overwritten by another leader's entry answers `not_leader`, not that leader's result (the term check).
+- An entry that commits in the same batch as the step-down answers with the result (apply first).
+
+The codec gets `[protocol]` tests: round trips, every truncation, trailing bytes, invalid values and golden
+bytes.
 
 #### Step 5.2: Client sessions (each write runs at most once)
 

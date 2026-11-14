@@ -39,6 +39,7 @@ public:
     void boolean(bool value) { u8(value ? 1 : 0); }
     void bytes(std::span<const std::byte> data);
     void string(std::string_view text);
+    void optional_string(std::optional<std::string_view> text);
     [[nodiscard]] std::size_t size() const { return buffer_.size(); }
     [[nodiscard]] std::vector<std::byte> take() && { return std::move(buffer_); }
 
@@ -70,6 +71,7 @@ public:
     bool boolean();
     std::vector<std::byte> bytes();
     std::string string();
+    std::optional<std::string> optional_string();
     [[nodiscard]] std::size_t remaining() const { return input_.size(); }
     void fail(decode_error error);
     [[nodiscard]] std::expected<void, decode_error> finish() const;
