@@ -256,6 +256,7 @@ Directory layout:
 ```
 include/hammurabi/{wire,raft,kv,replica,storage,net}/*.h   public headers
 include/hammurabi/attributes.h                             HAMMURABI_LIFETIMEBOUND, shared by the libraries
+include/hammurabi/overloaded.h                             the overloaded visitor helper, shared by the libraries
 src/{wire,raft,kv,replica,storage,net}/*.cpp               implementation
 apps/server/main.cpp, apps/cli/main.cpp
 tests/unit/, tests/sim/, tests/integration/, fuzz/
@@ -1774,15 +1775,17 @@ using response = std::variant<result, registered, not_leader, rejection>;
 
   The client format gets `type 4 = registered │ u64 client_id`.
 - `state_machine` takes `std::size_t max_sessions = 10'000` in its constructor, so tests can evict with 2 or 3.
-- `std::expected<reply, rejection> state_machine::apply(raft::log_index index, const command& cmd)`:
+- `std::expected<reply, rejection> state_machine::apply(std::uint64_t index, const command& cmd)`. The index is a
+  plain integer, not `raft::log_index`: `hammurabi_kv` does not depend on `hammurabi_raft` (section 5.3).
 
 ```cpp
-struct session { std::uint64_t last_sequence = 0; result last_result; raft::log_index last_used = 0; };
+struct session { std::uint64_t last_sequence = 0; result last_result; std::uint64_t last_used = 0; };
 std::map<std::uint64_t, session> sessions_;   // keyed by client id
 
 // apply():
 //   register_client           → create session (client id = index); return registered{index}
-//   client_id == 0 (get only) → execute, no session
+//   register_client with a client id → rejection::malformed
+//   client_id == 0 (get only) → execute, no session; any other operation → rejection::malformed
 //   unknown client id         → rejection::session_expired (never execute!)
 //   seq == last_sequence      → return last_result (a retry; do not execute again), last_used = index
 //   seq == last_sequence + 1  → execute, store result, last_used = index

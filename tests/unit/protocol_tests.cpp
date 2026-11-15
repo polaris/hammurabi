@@ -24,11 +24,14 @@ std::vector<std::byte> to_bytes(std::initializer_list<std::uint8_t> values) {
 std::vector<hammurabi::kv::request> sample_requests() {
     using namespace hammurabi;
     return {
-        {kv::get{.key = "foo"}},
-        {kv::put{.key = "foo", .value = "bar"}},
-        {kv::remove{.key = "foo"}},
-        {kv::cas{.key = "foo", .expected = "bar", .desired = "baz"}},
-        {kv::cas{.key = "foo", .expected = std::nullopt, .desired = "baz"}},
+        {.client_id = 0, .sequence = 0, .op = kv::get{.key = "foo"}},
+        {.client_id = 7, .sequence = 1, .op = kv::put{.key = "foo", .value = "bar"}},
+        {.client_id = 7, .sequence = 2, .op = kv::remove{.key = "foo"}},
+        {.client_id = 7, .sequence = 3, .op = kv::cas{.key = "foo", .expected = "bar", .desired = "baz"}},
+        {.client_id = 7, .sequence = 4, .op = kv::cas{.key = "foo", .expected = std::nullopt, .desired = "baz"}},
+        {.client_id = 0, .sequence = 0, .op = kv::register_client{}},
+        // large values: every byte of both u64 fields must survive
+        {.client_id = 0x0102030405060708, .sequence = 0xfffffffffffffffe, .op = kv::get{.key = ""}},
     };
 }
 
@@ -39,6 +42,8 @@ std::vector<hammurabi::kv::response> sample_responses() {
         kv::result{.code = kv::status::ok, .value = std::nullopt},
         kv::result{.code = kv::status::not_found, .value = std::nullopt},
         kv::result{.code = kv::status::cas_failed, .value = "old"},
+        kv::registered{.client_id = 42},
+        kv::registered{.client_id = 0x0102030405060708},
         kv::not_leader{.leader_address = "127.0.0.1:7001"},
         kv::not_leader{.leader_address = std::nullopt},
         kv::rejection::too_large,
@@ -53,7 +58,7 @@ TEST_CASE("round trip for every request", "[kv][protocol]") {
     using namespace hammurabi;
 
     const auto req = GENERATE(from_range(sample_requests()));
-    CAPTURE(req.op.index());
+    CAPTURE(req);
 
     const auto actual = kv::decode_request(kv::encode(req));
     REQUIRE(actual.has_value());
@@ -75,7 +80,7 @@ TEST_CASE("every truncation of an encoded request is a truncated error", "[kv][p
     using namespace hammurabi;
 
     const auto req = GENERATE(from_range(sample_requests()));
-    CAPTURE(req.op.index());
+    CAPTURE(req);
 
     const auto bytes = kv::encode(req);
     for (std::size_t length = 0; length < bytes.size(); ++length) {
@@ -104,7 +109,7 @@ TEST_CASE("every truncation of an encoded response is a truncated error", "[kv][
 TEST_CASE("decoding a request or response with trailing bytes fails", "[kv][protocol]") {
     using namespace hammurabi;
 
-    auto req = kv::encode(kv::request{kv::get{.key = "foo"}});
+    auto req = kv::encode(kv::request{.op = kv::get{.key = "foo"}});
     req.push_back(std::byte{0});
     const auto req_result = kv::decode_request(req);
     REQUIRE_FALSE(req_result.has_value());
@@ -123,7 +128,7 @@ TEST_CASE("decoding a request or response with an unknown version fails", "[kv][
     const auto version = GENERATE(as<std::uint8_t>{}, 0, 2, 255);
     CAPTURE(static_cast<int>(version));
 
-    auto req = kv::encode(kv::request{kv::get{.key = "foo"}});
+    auto req = kv::encode(kv::request{.op = kv::get{.key = "foo"}});
     req.front() = std::byte{version};
     const auto req_result = kv::decode_request(req);
     REQUIRE_FALSE(req_result.has_value());
@@ -141,7 +146,7 @@ TEST_CASE("decoding a response with an invalid byte fails with invalid_value", "
 
     // version 1, then the bytes below
     const auto input = GENERATE(to_bytes({1, 0, 3}),     // response type 0
-                                to_bytes({1, 4, 3}),     // response type 4
+                                to_bytes({1, 5, 3}),     // response type 5
                                 to_bytes({1, 1, 0, 0}),  // result with status 0
                                 to_bytes({1, 1, 99, 0}), // result with status 99
                                 to_bytes({1, 1, 1, 2}),  // result with present flag 2
@@ -157,9 +162,13 @@ TEST_CASE("decoding a response with an invalid byte fails with invalid_value", "
 TEST_CASE("request encoding is stable", "[kv][protocol]") {
     using namespace hammurabi;
 
-    // version, operation type put, key "k", value "v"
-    CHECK(kv::encode(kv::request{kv::put{.key = "k", .value = "v"}}) ==
-          to_bytes({1, 2, 0, 0, 0, 1, 'k', 0, 0, 0, 1, 'v'}));
+    // version, client 7, sequence 2, operation type put, key "k", value "v"
+    CHECK(kv::encode(kv::request{.client_id = 7, .sequence = 2, .op = kv::put{.key = "k", .value = "v"}}) ==
+          to_bytes({1, 0, 0, 0, 0, 0,   0, 0, 7, 0, 0,  0, 0, 0, 0, 0, 2, //
+                    2, 0, 0, 0, 1, 'k', 0, 0, 0, 1, 'v'}));
+    // version, no session, operation type register_client: no fields
+    CHECK(kv::encode(kv::request{.op = kv::register_client{}}) ==
+          to_bytes({1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5}));
 }
 
 TEST_CASE("response encoding is stable", "[kv][protocol]") {
@@ -172,4 +181,6 @@ TEST_CASE("response encoding is stable", "[kv][protocol]") {
     CHECK(kv::encode(kv::response{kv::not_leader{}}) == to_bytes({1, 2, 0}));
     // version, response type rejection, malformed
     CHECK(kv::encode(kv::response{kv::rejection::malformed}) == to_bytes({1, 3, 2}));
+    // version, response type registered, client id 258
+    CHECK(kv::encode(kv::response{kv::registered{.client_id = 258}}) == to_bytes({1, 4, 0, 0, 0, 0, 0, 0, 1, 2}));
 }

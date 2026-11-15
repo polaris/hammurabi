@@ -6,11 +6,12 @@
 #include <hammurabi/kv/format.h>
 #include <hammurabi/kv/protocol.h>
 
+#include <expected>
 #include <format>
 #include <string>
 
-// Lets Catch2 print KV operations, requests and responses in failed assertions instead of "{?}", using the
-// std::formatters from kv/format.h.
+// Lets Catch2 print KV operations, commands, requests, replies and responses in failed assertions instead of "{?}",
+// using the std::formatters from kv/format.h.
 //
 // Every test file that puts one of these types into an assertion must include this header, for the same reason
 // as raft_string_makers.h: otherwise the file instantiates Catch's default StringMaker for the same type (an ODR
@@ -38,6 +39,10 @@ template<>
 struct Catch::StringMaker<hammurabi::kv::cas> : hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::cas> {};
 
 template<>
+struct Catch::StringMaker<hammurabi::kv::register_client>
+: hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::register_client> {};
+
+template<>
 struct Catch::StringMaker<hammurabi::kv::operation>
 : hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::operation> {};
 
@@ -46,12 +51,24 @@ struct Catch::StringMaker<hammurabi::kv::request>
 : hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::request> {};
 
 template<>
+struct Catch::StringMaker<hammurabi::kv::command>
+: hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::command> {};
+
+template<>
 struct Catch::StringMaker<hammurabi::kv::status>
 : hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::status> {};
 
 template<>
 struct Catch::StringMaker<hammurabi::kv::result>
 : hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::result> {};
+
+template<>
+struct Catch::StringMaker<hammurabi::kv::registered>
+: hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::registered> {};
+
+template<>
+struct Catch::StringMaker<hammurabi::kv::reply> : hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::reply> {
+};
 
 template<>
 struct Catch::StringMaker<hammurabi::kv::not_leader>
@@ -64,5 +81,13 @@ struct Catch::StringMaker<hammurabi::kv::rejection>
 template<>
 struct Catch::StringMaker<hammurabi::kv::response>
 : hammurabi::kv::testing::formatter_string_maker<hammurabi::kv::response> {};
+
+// What state_machine::apply returns.
+template<>
+struct Catch::StringMaker<std::expected<hammurabi::kv::reply, hammurabi::kv::rejection>> {
+    static std::string convert(const std::expected<hammurabi::kv::reply, hammurabi::kv::rejection>& value) {
+        return value ? std::format("{}", *value) : std::format("{}", value.error());
+    }
+};
 
 #endif // HAMMURABI_TESTS_KV_STRING_MAKERS_H

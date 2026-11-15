@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -20,11 +21,21 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
 
 using namespace hammurabi;
+
+// One client's session: its id and the number of its last request.
+struct client_session {
+    std::uint64_t id = 0;
+    std::uint64_t sequence = 0;
+
+    // The next request of this client, numbered one higher than the last.
+    kv::request next(kv::operation op) { return {.client_id = id, .sequence = ++sequence, .op = std::move(op)}; }
+};
 
 struct stable_leader {
     int ticks = 0;
@@ -136,18 +147,33 @@ struct test_cluster {
     }
 
     // Submits without delivering; the answer arrives in responses once the test delivers.
-    request_id submit(replica& r, kv::operation op) {
+    request_id submit(replica& r, const kv::request& req) {
         const auto id = next_id++;
-        r.submit(id, kv::request{std::move(op)});
+        r.submit(id, req);
         return id;
     }
 
+    request_id submit(replica& r, client_session& session, kv::operation op) {
+        return submit(r, session.next(std::move(op)));
+    }
+
     // Submits, delivers everything, and returns the answer.
-    kv::response request(replica& r, kv::operation op) {
-        const auto id = submit(r, std::move(op));
+    kv::response request(replica& r, const kv::request& req) {
+        const auto id = submit(r, req);
         deliver_all();
         REQUIRE(responses.contains(id));
         return responses.at(id);
+    }
+
+    kv::response request(replica& r, client_session& session, kv::operation op) {
+        return request(r, session.next(std::move(op)));
+    }
+
+    // Registers a new client at the leader and waits until it is committed.
+    client_session register_client(replica& leader) {
+        const auto answer = request(leader, kv::request{.op = kv::register_client{}});
+        REQUIRE(std::holds_alternative<kv::registered>(answer));
+        return client_session{.id = std::get<kv::registered>(answer).client_id};
     }
 };
 
@@ -174,6 +200,18 @@ void single_replica_elect(replica& r, const raft::config& cfg) {
     REQUIRE(r.node().current_role() == raft::role::leader);
 }
 
+// Registers a client at a lone leader: its entry commits at once, so the answer comes with the next take_output.
+client_session single_replica_register(replica& r) {
+    r.submit(0, kv::request{.op = kv::register_client{}});
+    const auto out = r.take_output();
+    REQUIRE(out.responses.size() == 1);
+    const auto* answer = std::get_if<kv::registered>(&out.responses.front().second);
+    REQUIRE(answer != nullptr);
+    return client_session{.id = answer->client_id};
+}
+
+const kv::response ok{kv::result{.code = kv::status::ok}};
+
 } // namespace
 
 TEST_CASE("constructor rejects client addresses that don't match the members", "[replica]") {
@@ -194,17 +232,20 @@ TEST_CASE("put then get returns the value", "[replica]") {
     test_cluster c;
     const auto elected = c.elect_leader();
     auto& leader = c.replicas.at(elected.leader);
+    auto client = c.register_client(leader);
 
-    REQUIRE(c.request(leader, kv::put{.key = "x", .value = "1"}) == kv::response{kv::result{.code = kv::status::ok}});
-    REQUIRE(c.request(leader, kv::get{.key = "x"}) == kv::response{kv::result{.code = kv::status::ok, .value = "1"}});
+    REQUIRE(c.request(leader, client, kv::put{.key = "x", .value = "1"}) == ok);
+    REQUIRE(c.request(leader, client, kv::get{.key = "x"}) ==
+            kv::response{kv::result{.code = kv::status::ok, .value = "1"}});
 }
 
 TEST_CASE("followers apply committed entries too", "[replica]") {
     test_cluster c;
     const auto elected = c.elect_leader();
     auto& leader = c.replicas.at(elected.leader);
+    auto client = c.register_client(leader);
 
-    REQUIRE(c.request(leader, kv::put{.key = "x", .value = "1"}) == kv::response{kv::result{.code = kv::status::ok}});
+    REQUIRE(c.request(leader, client, kv::put{.key = "x", .value = "1"}) == ok);
 
     for (const auto i : elected.followers) {
         const auto& r = c.replicas.at(i);
@@ -224,12 +265,14 @@ TEST_CASE("results pass through unchanged", "[replica]") {
     test_cluster c;
     const auto elected = c.elect_leader();
     auto& leader = c.replicas.at(elected.leader);
+    auto client = c.register_client(leader);
 
-    REQUIRE(c.request(leader, kv::put{.key = "x", .value = "1"}) == kv::response{kv::result{.code = kv::status::ok}});
-    REQUIRE(c.request(leader, kv::get{.key = "missing"}) == kv::response{kv::result{.code = kv::status::not_found}});
-    REQUIRE(c.request(leader, kv::cas{.key = "x", .expected = "2", .desired = "3"}) ==
+    REQUIRE(c.request(leader, client, kv::put{.key = "x", .value = "1"}) == ok);
+    REQUIRE(c.request(leader, client, kv::get{.key = "missing"}) ==
+            kv::response{kv::result{.code = kv::status::not_found}});
+    REQUIRE(c.request(leader, client, kv::cas{.key = "x", .expected = "2", .desired = "3"}) ==
             kv::response{kv::result{.code = kv::status::cas_failed, .value = "1"}});
-    REQUIRE(c.request(leader, kv::cas{.key = "missing", .expected = "1", .desired = "3"}) ==
+    REQUIRE(c.request(leader, client, kv::cas{.key = "missing", .expected = "1", .desired = "3"}) ==
             kv::response{kv::result{.code = kv::status::cas_failed, .value = std::nullopt}});
 }
 
@@ -243,13 +286,14 @@ TEST_CASE("a single-node cluster answers at the next take_output", "[replica]") 
     single_replica_elect(r, cfg);
     const auto startup = r.take_output(); // the leader's committed no-op: nobody waits for it
     REQUIRE(startup.responses.empty());
+    auto client = single_replica_register(r);
 
-    r.submit(1, kv::request{kv::put{.key = "x", .value = "42"}});
+    r.submit(1, client.next(kv::put{.key = "x", .value = "42"}));
     const auto out = r.take_output();
 
     REQUIRE(out.responses.size() == 1);
     CHECK(out.responses.front().first == 1);
-    CHECK(out.responses.front().second == kv::response{kv::result{.code = kv::status::ok}});
+    CHECK(out.responses.front().second == ok);
     CHECK(out.messages.empty()); // no peers, so nothing to send
     CHECK(r.machine().read(kv::get{.key = "x"}) == kv::result{.code = kv::status::ok, .value = "42"});
 }
@@ -260,10 +304,11 @@ TEST_CASE("a request to a follower answers not_leader with the leader's client a
     const auto elected = c.elect_leader();
     const auto& leader = c.replicas.at(elected.leader);
     auto& follower = c.replicas.at(elected.followers.at(0));
-    const auto leader_log_before = leader.node().log().size(); // already holds the leader's no-op
+    auto client = c.register_client(c.replicas.at(elected.leader));
+    const auto leader_log_before = leader.node().log().size(); // the leader's no-op and the registration
 
     // take_output() directly instead of request(): deliver_all() would hide whether the answer needed messages.
-    const auto id = c.submit(follower, kv::put{.key = "x", .value = "1"});
+    const auto id = c.submit(follower, client, kv::put{.key = "x", .value = "1"});
     const auto out = follower.take_output();
 
     REQUIRE(out.responses.size() == 1);
@@ -286,23 +331,26 @@ TEST_CASE("a request at exactly max_payload_bytes is accepted", "[replica]") {
     replica r(cfg, &store, {{1, "a"}});
 
     single_replica_elect(r, cfg);
+    auto client = single_replica_register(r);
 
-    const auto log_before = r.node().log().size(); // the leader's no-op
+    const auto log_before = r.node().log().size(); // the leader's no-op and the registration
 
     const auto op = kv::put{.key = "x", .value = std::string(max_payload_bytes - 1, 'x')};
     REQUIRE(op.key.size() + op.value.size() == max_payload_bytes);
 
-    r.submit(1, kv::request{.op = op});
+    const auto req = client.next(op);
+    r.submit(1, req);
     REQUIRE(r.node().log().size() == log_before + 1);
 
     const auto out = r.take_output();
     REQUIRE(out.responses.size() == 1);
-    CHECK(out.responses.front().second == kv::response{kv::result{.code = kv::status::ok}});
+    CHECK(out.responses.front().second == ok);
 
-    // The log holds the log format (encode(op)), not the client format with its version byte.
+    // The log holds the log format (encode(command)), not the client format with its version byte.
+    const auto cmd = kv::command{.client_id = req.client_id, .sequence = req.sequence, .op = op};
     const auto& entry = r.node().log().back();
     CHECK(entry ==
-          raft::log_entry{.term = r.node().current_term(), .kind = raft::entry_kind::command, .data = kv::encode(op)});
+          raft::log_entry{.term = r.node().current_term(), .kind = raft::entry_kind::command, .data = kv::encode(cmd)});
 }
 
 TEST_CASE("a request over max_payload_bytes answers too_large and adds nothing to the log", "[replica]") {
@@ -315,11 +363,12 @@ TEST_CASE("a request over max_payload_bytes answers too_large and adds nothing t
     replica r(cfg, &store, {{1, "a"}});
 
     single_replica_elect(r, cfg);
+    auto client = single_replica_register(r);
 
     // A copy: log() returns a span, which would show the live log (or dangle), not the log as it was.
-    const auto log_before = r.node().log() | std::ranges::to<std::vector>(); // the leader's no-op
+    const auto log_before = r.node().log() | std::ranges::to<std::vector>(); // the no-op and the registration
 
-    r.submit(1, kv::request{.op = op});
+    r.submit(1, client.next(op));
     REQUIRE(std::ranges::equal(r.node().log(), log_before));
 
     const auto out = r.take_output();
@@ -335,9 +384,10 @@ TEST_CASE("raft's command_too_large answers too_large", "[replica]") {
     replica r(cfg, &store, {{1, "a"}});
 
     single_replica_elect(r, cfg);
-    const auto log_before = r.node().log().size(); // the leader's no-op
+    auto client = single_replica_register(r);
+    const auto log_before = r.node().log().size(); // the leader's no-op and the registration
 
-    r.submit(1, kv::request{kv::put{.key = "k", .value = std::string(200, 'v')}});
+    r.submit(1, client.next(kv::put{.key = "k", .value = std::string(200, 'v')}));
     CHECK(r.node().log().size() == log_before);
 
     const auto out = r.take_output();
@@ -353,9 +403,10 @@ TEST_CASE("a pending request answers not_leader when the leader steps down", "[r
     const auto old = c.elect_leader().leader;
     auto& old_leader = c.replicas.at(old);
     const auto old_term = old_leader.node().current_term();
+    auto client = c.register_client(old_leader);
 
     c.isolated.insert(old_leader.node().id());
-    const auto id = c.submit(old_leader, kv::put{.key = "x", .value = "1"});
+    const auto id = c.submit(old_leader, client, kv::put{.key = "x", .value = "1"});
     c.deliver_all();
     REQUIRE_FALSE(c.responses.contains(id)); // cut off, so it can't commit
 
@@ -380,26 +431,28 @@ TEST_CASE("an entry overwritten by another leader answers not_leader, not that l
     test_cluster c;
     const auto old = c.elect_leader().leader;
     auto& old_leader = c.replicas.at(old);
+    // Both clients register while all nodes are connected: indexes 2 and 3, committed everywhere.
+    auto ours = c.register_client(old_leader);
+    auto other = c.register_client(old_leader);
 
     c.isolated.insert(old_leader.node().id());
-    const auto first = c.submit(old_leader, kv::put{.key = "x", .value = "1"});  // index 2
-    const auto second = c.submit(old_leader, kv::put{.key = "x", .value = "2"}); // index 3
+    const auto first = c.submit(old_leader, ours, kv::put{.key = "x", .value = "1"});  // index 4
+    const auto second = c.submit(old_leader, ours, kv::put{.key = "x", .value = "2"}); // index 5
     c.deliver_all();
 
     const auto elected = c.elect_leader();
     auto& new_leader = c.replicas.at(elected.leader);
-    // The new leader's no-op takes index 2, and another client's put takes index 3.
-    REQUIRE(c.request(new_leader, kv::put{.key = "y", .value = "9"}) ==
-            kv::response{kv::result{.code = kv::status::ok}});
-    REQUIRE(new_leader.node().log().size() == 3);
+    // The new leader's no-op takes index 4, and the other client's put takes index 5.
+    REQUIRE(c.request(new_leader, other, kv::put{.key = "y", .value = "9"}) == ok);
+    REQUIRE(new_leader.node().log().size() == 5);
 
-    // Reconnect and let only the new leader speak: one append_entries replaces indexes 2 and 3 and commits them.
+    // Reconnect and let only the new leader speak: one append_entries replaces indexes 4 and 5 and commits them.
     c.heal();
     c.run_one_for(elected.leader, raft::config{}.heartbeat_interval_ticks);
 
     const auto redirect = kv::response{kv::not_leader{.leader_address = c.addresses.at(new_leader.node().id())}};
-    CHECK(c.responses.at(first) == redirect);  // index 2 now holds the no-op
-    CHECK(c.responses.at(second) == redirect); // index 3 now holds put y=9, whose result would be "ok"
+    CHECK(c.responses.at(first) == redirect);  // index 4 now holds the no-op
+    CHECK(c.responses.at(second) == redirect); // index 5 now holds put y=9, whose result would be "ok"
     CHECK(old_leader.machine().read(kv::get{.key = "y"}) == kv::result{.code = kv::status::ok, .value = "9"});
     CHECK(old_leader.machine().read(kv::get{.key = "x"}) == kv::result{.code = kv::status::not_found});
 }
@@ -413,11 +466,12 @@ TEST_CASE("an entry that commits in the same batch as the step-down answers with
     const auto old_id = old_leader.node().id();
     const auto keeper_id = c.replicas.at(before.followers.at(0)).node().id(); // will store the entry
     const auto other_id = c.replicas.at(before.followers.at(1)).node().id();  // won't
+    auto client = c.register_client(old_leader);                              // committed on all three
 
     // The entry reaches keeper, but keeper's reply and everything to other are lost:
     // the old leader never learns that the entry is on a majority.
     c.blocked = {{keeper_id, old_id}, {old_id, other_id}};
-    const auto id = c.submit(old_leader, kv::put{.key = "x", .value = "1"});
+    const auto id = c.submit(old_leader, client, kv::put{.key = "x", .value = "1"});
     c.deliver_all();
     REQUIRE_FALSE(c.responses.contains(id));
     REQUIRE(c.replicas.at(keeper_id - 1).node().log().size() == old_leader.node().log().size());
@@ -435,6 +489,90 @@ TEST_CASE("an entry that commits in the same batch as the step-down answers with
 
     CHECK(old_leader.node().current_role() == raft::role::follower);
     REQUIRE(c.responses.contains(id));
-    CHECK(c.responses.at(id) == kv::response{kv::result{.code = kv::status::ok}});
+    CHECK(c.responses.at(id) == ok);
     CHECK(old_leader.machine().read(kv::get{.key = "x"}) == kv::result{.code = kv::status::ok, .value = "1"});
+}
+
+TEST_CASE("register_client answers with the log index of its entry", "[replica]") {
+    test_cluster c;
+    auto& leader = c.replicas.at(c.elect_leader().leader);
+
+    const auto first = c.register_client(leader);
+    CHECK(first.id == leader.node().log().size()); // the entry just appended
+    const auto second = c.register_client(leader);
+    CHECK(second.id == first.id + 1);
+}
+
+TEST_CASE("a request that breaks the session rules answers malformed and adds nothing to the log", "[replica]") {
+    const auto req = GENERATE(
+        kv::request{.client_id = 0, .sequence = 0, .op = kv::put{.key = "x", .value = "1"}}, // put without a session
+        kv::request{.client_id = 0, .sequence = 0, .op = kv::remove{.key = "x"}},
+        kv::request{.client_id = 0, .sequence = 0, .op = kv::cas{.key = "x", .expected = std::nullopt, .desired = "1"}},
+        kv::request{.client_id = 0, .sequence = 1, .op = kv::get{.key = "x"}},   // a sequence without a session
+        kv::request{.client_id = 0, .sequence = 1, .op = kv::register_client{}}, // the same for register_client
+        kv::request{.client_id = 2, .sequence = 1, .op = kv::register_client{}}, // registering again
+        kv::request{.client_id = 2, .sequence = 0, .op = kv::put{.key = "x", .value = "1"}}); // sequence 0
+    CAPTURE(req);
+
+    raft::memory_storage store;
+    const raft::config cfg{.self = 1, .members = {1}};
+    replica r(cfg, &store, {{1, "a"}});
+    single_replica_elect(r, cfg);
+    REQUIRE(single_replica_register(r).id == 2); // so client id 2 above exists
+    const auto log_before = r.node().log().size();
+
+    r.submit(1, req);
+    CHECK(r.node().log().size() == log_before);
+
+    const auto out = r.take_output();
+    REQUIRE(out.responses.size() == 1);
+    CHECK(out.responses.front().second == kv::response{kv::rejection::malformed});
+}
+
+TEST_CASE("a get without a session goes through the log", "[replica]") {
+    test_cluster c;
+    auto& leader = c.replicas.at(c.elect_leader().leader);
+    auto client = c.register_client(leader);
+    REQUIRE(c.request(leader, client, kv::put{.key = "x", .value = "1"}) == ok);
+
+    CHECK(c.request(leader, kv::request{.op = kv::get{.key = "x"}}) ==
+          kv::response{kv::result{.code = kv::status::ok, .value = "1"}});
+}
+
+TEST_CASE("a retried cas at the new leader answers ok, not cas_failed", "[replica]") {
+    // The example of section 5.8: the cas commits, but its answer never reaches the client. The client
+    // retries the same request at the new leader, which has the session and answers from it.
+    test_cluster c;
+    const auto old = c.elect_leader().leader;
+    auto& old_leader = c.replicas.at(old);
+    auto client = c.register_client(old_leader);
+
+    REQUIRE(c.request(old_leader, client, kv::put{.key = "balance", .value = "100"}) == ok);
+
+    const auto cas = client.next(kv::cas{.key = "balance", .expected = "100", .desired = "50"});
+    REQUIRE(c.request(old_leader, cas) == ok); // committed and applied, but this answer never reaches the client
+
+    c.isolated.insert(old_leader.node().id());
+    auto& new_leader = c.replicas.at(c.elect_leader().leader);
+
+    CHECK(c.request(new_leader, cas) == ok); // the same request; without sessions: cas_failed, balance is 50
+    CHECK(new_leader.machine().read(kv::get{.key = "balance"}) == kv::result{.code = kv::status::ok, .value = "50"});
+
+    // The session goes on: the next number runs normally.
+    CHECK(c.request(new_leader, client, kv::get{.key = "balance"}) ==
+          kv::response{kv::result{.code = kv::status::ok, .value = "50"}});
+}
+
+TEST_CASE("an unknown client id answers session_expired on every node and executes nothing", "[replica]") {
+    // What an evicted client sees (the eviction itself is tested in [kv]): the request reaches the log, and
+    // every node refuses it alike instead of running it a second time.
+    test_cluster c;
+    auto& leader = c.replicas.at(c.elect_leader().leader);
+
+    CHECK(c.request(leader, kv::request{.client_id = 99, .sequence = 1, .op = kv::put{.key = "x", .value = "1"}}) ==
+          kv::response{kv::rejection::session_expired});
+    c.run_for(raft::config{}.heartbeat_interval_ticks);
+    for (const auto& r : c.replicas) {
+        CHECK(r.machine().read(kv::get{.key = "x"}) == kv::result{.code = kv::status::not_found});
+    }
 }

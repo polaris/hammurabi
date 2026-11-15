@@ -1,6 +1,7 @@
 #include <hammurabi/kv/command.h>
 #include <hammurabi/kv/protocol.h>
 #include <hammurabi/kv/state_machine.h>
+#include <hammurabi/overloaded.h>
 #include <hammurabi/raft/node.h>
 #include <hammurabi/raft/types.h>
 #include <hammurabi/replica/replica.h>
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <expected>
 #include <format>
 #include <iterator>
 #include <map>
@@ -22,11 +24,6 @@ namespace hammurabi {
 
 namespace {
 
-template<class... Ts>
-struct overloaded : Ts... {
-    using Ts::operator()...;
-};
-
 std::size_t payload_bytes(const kv::operation& op) {
     return std::visit(
         overloaded{
@@ -34,8 +31,29 @@ std::size_t payload_bytes(const kv::operation& op) {
             [](const kv::put& o) { return o.key.size() + o.value.size(); },
             [](const kv::remove& o) { return o.key.size(); },
             [](const kv::cas& o) { return o.key.size() + (o.expected ? o.expected->size() : 0) + o.desired.size(); },
+            [](const kv::register_client&) { return std::size_t{0}; },
         },
         op);
+}
+
+// The session rules of section 5.8. The decoder only checks shape, so these are checked here,
+// before anything reaches the log.
+bool follows_session_rules(const kv::request& req) {
+    const bool sessionless =
+        std::holds_alternative<kv::get>(req.op) || std::holds_alternative<kv::register_client>(req.op);
+    if (req.client_id == 0) {
+        return sessionless && req.sequence == 0;
+    }
+    // A real client never registers again, and numbers its requests from 1. Sequence 0 right after
+    // registering would equal last_sequence and be answered as a "retry".
+    return !std::holds_alternative<kv::register_client>(req.op) && req.sequence >= 1;
+}
+
+kv::response as_response(const std::expected<kv::reply, kv::rejection>& answer) {
+    if (!answer) {
+        return answer.error();
+    }
+    return std::visit([](const auto& r) -> kv::response { return r; }, *answer);
 }
 
 raft::config verify_client_addresses(raft::config cfg, const std::map<raft::node_id, std::string>& client_addresses) {
@@ -64,11 +82,17 @@ void replica::receive(const raft::envelope& env) {
 }
 
 void replica::submit(request_id id, const kv::request& req) {
+    if (!follows_session_rules(req)) {
+        out_.responses.emplace_back(id, kv::rejection::malformed);
+        return;
+    }
     if (payload_bytes(req.op) > max_payload_bytes) { // 1 KiB, section 5.6
         out_.responses.emplace_back(id, kv::rejection::too_large);
         return;
     }
-    const auto index = node_.propose(kv::encode(req.op));
+    // The log format, not the client format: same fields, but no version byte.
+    const auto index =
+        node_.propose(kv::encode(kv::command{.client_id = req.client_id, .sequence = req.sequence, .op = req.op}));
     if (!index) {
         out_.responses.emplace_back(id, to_response(index.error()));
         return;
@@ -88,14 +112,14 @@ replica_output replica::take_output() {
     // Apply first, then flush: an entry can commit in the same batch in which this node steps down,
     // and its client deserves the real result.
     for (const auto& [index, entry] : raft_out.committed) {
-        std::optional<kv::result> result; // stays empty for a no-op
+        std::optional<kv::response> result; // stays empty for a no-op
         if (entry.kind == raft::entry_kind::command) {
-            const auto op = kv::decode_operation(entry.data);
-            if (!op) {
+            const auto cmd = kv::decode_command(entry.data);
+            if (!cmd) {
                 // Only submit() writes commands, so this is corruption (e.g. a damaged log file), not bad input.
-                throw std::runtime_error(std::format("log entry {} is not a valid operation", index));
+                throw std::runtime_error(std::format("log entry {} is not a valid command", index));
             }
-            result = machine_.apply(*op);
+            result = as_response(machine_.apply(index, *cmd));
         }
 
         // Look up no-ops too: a new leader's no-op may have overwritten the entry a client waits for.

@@ -15,12 +15,17 @@ namespace hammurabi::kv {
 
 namespace {
 
-enum class response_type : std::uint8_t { result = 1, not_leader = 2, rejection = 3 };
+enum class response_type : std::uint8_t { result = 1, not_leader = 2, rejection = 3, registered = 4 };
 
 void write(wire::writer& w, const result& r) {
     w.u8(std::to_underlying(response_type::result));
     w.u8(std::to_underlying(r.code));
     w.optional_string(r.value);
+}
+
+void write(wire::writer& w, const registered& r) {
+    w.u8(std::to_underlying(response_type::registered));
+    w.u64(r.client_id);
 }
 
 void write(wire::writer& w, const not_leader& r) {
@@ -67,6 +72,8 @@ std::unexpected<wire::decode_error> reject(wire::reader& r, wire::decode_error e
 std::vector<std::byte> encode(const request& req) {
     wire::writer w;
     w.u8(client_wire_version);
+    w.u64(req.client_id);
+    w.u64(req.sequence);
     write(w, req.op);
     return std::move(w).take();
 }
@@ -84,12 +91,15 @@ std::expected<request, wire::decode_error> decode_request(std::span<const std::b
     if (version != client_wire_version) {
         return reject(r, wire::decode_error::invalid_value);
     }
+    // Separate statements: the members must be read in this order.
+    const auto client_id = r.u64();
+    const auto sequence = r.u64();
     auto op = read_operation(r);
     const auto done = r.finish();
     if (!done) {
         return std::unexpected(done.error());
     }
-    return request{std::move(op)};
+    return request{.client_id = client_id, .sequence = sequence, .op = std::move(op)};
 }
 
 std::expected<response, wire::decode_error> decode_response(std::span<const std::byte> bytes) {
@@ -109,6 +119,9 @@ std::expected<response, wire::decode_error> decode_response(std::span<const std:
             break;
         case response_type::rejection:
             resp = read_rejection(r);
+            break;
+        case response_type::registered:
+            resp = registered{.client_id = r.u64()};
             break;
         default:
             return reject(r, wire::decode_error::invalid_value);

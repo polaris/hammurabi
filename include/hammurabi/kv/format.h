@@ -10,8 +10,8 @@
 #include <utility>
 #include <variant>
 
-// std::formatters for operations, requests and responses: readable test failures now, CLI output later.
-// Strings are printed in quotes, so an empty value is visible. ("{:?}" would escape them, but GCC 14 lacks it.)
+// std::formatters for operations, commands, requests, replies and responses: readable test failures now, CLI output
+// later. Strings are printed in quotes, so an empty value is visible. ("{:?}" would escape them, but GCC 14 lacks it.)
 namespace hammurabi::kv::detail {
 
 struct no_spec_formatter {
@@ -54,6 +54,13 @@ struct std::formatter<hammurabi::kv::cas> : hammurabi::kv::detail::no_spec_forma
 };
 
 template<>
+struct std::formatter<hammurabi::kv::register_client> : hammurabi::kv::detail::no_spec_formatter {
+    auto format(const hammurabi::kv::register_client& /*op*/, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "RegisterClient");
+    }
+};
+
+template<>
 struct std::formatter<hammurabi::kv::operation> : hammurabi::kv::detail::no_spec_formatter {
     auto format(const hammurabi::kv::operation& op, std::format_context& ctx) const {
         return std::visit([&ctx](const auto& o) { return std::format_to(ctx.out(), "{}", o); }, op);
@@ -63,7 +70,14 @@ struct std::formatter<hammurabi::kv::operation> : hammurabi::kv::detail::no_spec
 template<>
 struct std::formatter<hammurabi::kv::request> : hammurabi::kv::detail::no_spec_formatter {
     auto format(const hammurabi::kv::request& req, std::format_context& ctx) const {
-        return std::format_to(ctx.out(), "Request{{{}}}", req.op);
+        return std::format_to(ctx.out(), "Request{{client {}, seq {}, {}}}", req.client_id, req.sequence, req.op);
+    }
+};
+
+template<>
+struct std::formatter<hammurabi::kv::command> : hammurabi::kv::detail::no_spec_formatter {
+    auto format(const hammurabi::kv::command& cmd, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "Command{{client {}, seq {}, {}}}", cmd.client_id, cmd.sequence, cmd.op);
     }
 };
 
@@ -87,6 +101,20 @@ template<>
 struct std::formatter<hammurabi::kv::result> : hammurabi::kv::detail::no_spec_formatter {
     auto format(const hammurabi::kv::result& r, std::format_context& ctx) const {
         return std::format_to(ctx.out(), "Result{{{}, {}}}", r.code, hammurabi::kv::detail::quoted(r.value));
+    }
+};
+
+template<>
+struct std::formatter<hammurabi::kv::registered> : hammurabi::kv::detail::no_spec_formatter {
+    auto format(const hammurabi::kv::registered& r, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "Registered{{{}}}", r.client_id);
+    }
+};
+
+template<>
+struct std::formatter<hammurabi::kv::reply> : hammurabi::kv::detail::no_spec_formatter {
+    auto format(const hammurabi::kv::reply& r, std::format_context& ctx) const {
+        return std::visit([&ctx](const auto& x) { return std::format_to(ctx.out(), "{}", x); }, r);
     }
 };
 
